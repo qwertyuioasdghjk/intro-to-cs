@@ -6,3 +6,5 @@ venv/
 .env
 .env.*
 !.env.example
+dcas_api_metadata.db*
+dcas_api_network/

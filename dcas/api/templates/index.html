@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b2d">
+  <meta name="description" content="Manage distributed files and verify their integrity with DCAS.">
+  <title>DCAS — Distributed storage</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#overview" aria-label="DCAS home">
+        <span class="brand-mark" aria-hidden="true">D</span>
+        <span><strong>DCAS</strong><small>Distributed storage</small></span>
+      </a>
+
+      <div class="sidebar-label">WORKSPACE</div>
+      <nav class="main-nav" aria-label="Main navigation">
+        <a class="nav-link active" href="#overview"><span class="nav-icon">⌂</span>Overview</a>
+        <a class="nav-link" href="#files"><span class="nav-icon">▤</span>Files</a>
+        <a class="nav-link" href="#network"><span class="nav-icon">◈</span>Network</a>
+        <a class="nav-link" href="#activity"><span class="nav-icon">◷</span>Activity</a>
+      </nav>
+
+      <div class="sidebar-spacer"></div>
+      <div class="sidebar-network">
+        <div class="sidebar-network-heading"><span class="status-dot"></span> Network health</div>
+        <strong id="sidebar-health">Checking…</strong>
+        <span id="sidebar-node-count">Connecting to your nodes</span>
+        <div class="health-track"><span id="health-bar"></span></div>
+      </div>
+      <div class="sidebar-footer"><span class="brand-mark small">D</span><span>Content you can verify.</span></div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <div class="breadcrumbs"><span>Workspace</span><span class="crumb-slash">/</span><strong id="current-section">Overview</strong></div>
+        <div class="topbar-actions">
+          <span class="live-pill"><span class="status-dot"></span> Live network</span>
+          <button class="icon-button" id="refresh-button" type="button" aria-label="Refresh dashboard" title="Refresh dashboard">↻</button>
+          <span class="avatar" aria-label="DCAS workspace">D</span>
+        </div>
+      </header>
+
+      <div class="page-content">
+        <section class="welcome-row" id="overview">
+          <div>
+            <p class="eyebrow"><span class="eyebrow-line"></span> DECENTRALIZED CONTENT-ADDRESSED STORAGE</p>
+            <h1>Your files.<br><span>Distributed by design.</span></h1>
+            <p class="welcome-copy">Store once, verify anytime. Your content is split, fingerprinted, and replicated across your storage network.</p>
+          </div>
+          <div class="welcome-art" aria-hidden="true">
+            <div class="orbit orbit-one"></div>
+            <div class="orbit orbit-two"></div>
+            <div class="art-center"><span>DC</span><i></i></div>
+            <span class="orbit-node node-a"></span><span class="orbit-node node-b"></span><span class="orbit-node node-c"></span>
+          </div>
+        </section>
+
+        <section class="stat-grid" aria-label="Storage summary">
+          <article class="stat-card">
+            <div class="stat-top"><span class="stat-icon mint">▤</span><span class="stat-label">Stored files</span></div>
+            <div class="stat-value" id="stat-files">—</div>
+            <div class="stat-foot">Content-addressed records</div>
+          </article>
+          <article class="stat-card">
+            <div class="stat-top"><span class="stat-icon violet">◫</span><span class="stat-label">Storage used</span></div>
+            <div class="stat-value" id="stat-storage">—</div>
+            <div class="stat-foot" id="stat-chunks">Across all storage nodes</div>
+          </article>
+          <article class="stat-card">
+            <div class="stat-top"><span class="stat-icon blue">◈</span><span class="stat-label">Nodes online</span></div>
+            <div class="stat-value" id="stat-nodes">—</div>
+            <div class="stat-foot" id="stat-replication">Network availability</div>
+          </article>
+          <article class="stat-card">
+            <div class="stat-top"><span class="stat-icon amber">◷</span><span class="stat-label">Audit events</span></div>
+            <div class="stat-value" id="stat-events">—</div>
+            <div class="stat-foot">Recorded verification history</div>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel upload-panel" id="upload">
+            <div class="panel-heading">
+              <div><p class="eyebrow">ADD TO YOUR NETWORK</p><h2>Upload a file</h2></div>
+              <span class="heading-mark">01</span>
+            </div>
+            <form id="upload-form">
+              <label class="dropzone" id="dropzone" for="file-input">
+                <input id="file-input" name="file" type="file" required>
+                <span class="upload-icon" aria-hidden="true">↑</span>
+                <strong id="file-prompt">Drop a file here, or <span>browse</span></strong>
+                <small id="file-hint">Any file type · Stored across your network</small>
+              </label>
+              <div class="form-row">
+                <label class="field-label" for="owner-input">Owner <span>Optional</span>
+                  <input id="owner-input" name="owner" type="text" value="system" maxlength="120" placeholder="e.g. your organization">
+                </label>
+                <label class="field-label" for="tags-input">Tags <span>Optional</span>
+                  <input id="tags-input" name="tags" type="text" placeholder="research, archive">
+                </label>
+              </div>
+              <button class="button button-primary upload-submit" id="upload-submit" type="submit"><span>＋</span> Add file to network</button>
+            </form>
+            <div class="upload-divider"><span>OR SAVE A NOTE</span></div>
+            <form id="text-form" class="text-form">
+              <label class="field-label" for="text-content">Text content</label>
+              <textarea id="text-content" rows="3" placeholder="Write or paste text to store…"></textarea>
+              <div class="text-form-bottom">
+                <input id="text-filename" type="text" maxlength="255" value="note.txt" aria-label="Note filename" placeholder="Filename">
+                <button class="button button-secondary" type="submit">Save note <span>↗</span></button>
+              </div>
+            </form>
+          </article>
+
+          <article class="panel files-panel" id="files">
+            <div class="panel-heading files-heading">
+              <div><p class="eyebrow">CONTENT LIBRARY</p><h2>Your files <span class="count-badge" id="files-count">0</span></h2></div>
+              <div class="search-wrap"><span aria-hidden="true">⌕</span><input id="search-input" type="search" placeholder="Search files or CID…" aria-label="Search files"></div>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>FILE</th><th>SIZE</th><th>OWNER</th><th>ADDED</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
+                <tbody id="files-body"><tr><td colspan="5" class="table-message">Loading your files…</td></tr></tbody>
+              </table>
+            </div>
+            <div class="panel-bottom"><span id="files-summary">Loading file library</span><a href="#files" id="clear-search" class="text-link hidden">Clear search</a></div>
+          </article>
+        </section>
+
+        <section class="panel network-panel" id="network">
+          <div class="panel-heading">
+            <div><p class="eyebrow">DISTRIBUTED INFRASTRUCTURE</p><h2>Storage network</h2></div>
+            <div class="network-summary"><span class="status-dot"></span><span id="network-summary">Loading node status…</span></div>
+          </div>
+          <div class="node-grid" id="node-grid"><div class="empty-state">Connecting to storage nodes…</div></div>
+        </section>
+
+        <section class="panel activity-panel" id="activity">
+          <div class="panel-heading">
+            <div><p class="eyebrow">TRANSPARENT BY DEFAULT</p><h2>Recent activity</h2></div>
+            <span class="activity-caption">Latest network events</span>
+          </div>
+          <div class="activity-list" id="activity-list"><div class="empty-state">Loading audit history…</div></div>
+        </section>
+
+        <footer class="page-footer"><span><span class="footer-mark">D</span> DCAS <span class="footer-divider">·</span> Decentralized Content-Addressed Storage</span><span>Integrity, built into every byte.</span></footer>
+      </div>
+    </main>
+  </div>
+
+  <dialog class="detail-dialog" id="file-dialog" aria-labelledby="dialog-title">
+    <div class="dialog-header">
+      <div><p class="eyebrow">CONTENT DETAILS</p><h2 id="dialog-title">File details</h2></div>
+      <button class="icon-button close-dialog" type="button" aria-label="Close file details">×</button>
+    </div>
+    <div id="file-details" class="dialog-body"></div>
+    <div class="dialog-actions">
+      <a class="button button-secondary" id="download-link" href="#" download>↓ Download</a>
+      <button class="button button-secondary" data-verify="chunks" type="button">Verify chunks</button>
+      <button class="button button-primary" data-verify="full" type="button">Verify integrity <span>↗</span></button>
+    </div>
+    <div class="verify-output" id="verify-output" role="status" aria-live="polite"></div>
+  </dialog>
+
+  <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>

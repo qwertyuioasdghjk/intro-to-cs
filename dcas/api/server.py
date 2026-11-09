@@ -2,6 +2,7 @@
 Flask REST API for the Decentralized Content-Addressed Storage system.
 
 Endpoints:
+    GET    /                  Web dashboard
     POST   /api/upload         Upload a file
     GET    /api/files           List stored files
     GET    /api/file/<cid>      Get file info
@@ -22,7 +23,7 @@ import os
 import json
 import tempfile
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, jsonify, render_template, request, send_file
 
 from ..storage.network import StorageNetwork
 from ..verifier.verifier import IntegrityVerifier
@@ -57,6 +58,16 @@ def create_app(
     )
     verifier = IntegrityVerifier(network)
     metadata = MetadataStore(db_path)
+    app.extensions["dcas"] = {
+        "network": network,
+        "verifier": verifier,
+        "metadata": metadata,
+    }
+
+    @app.route("/")
+    def index():
+        """Serve the DCAS web dashboard."""
+        return render_template("index.html")
 
     # ── Upload ──────────────────────────────────────────────────────
 
