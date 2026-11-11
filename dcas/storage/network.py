@@ -201,6 +201,24 @@ class StorageNetwork:
 
         return FileChunker.reassemble(chunks)
 
+    def delete_file_chunks(
+        self,
+        manifest: dict,
+        referenced_chunk_hashes: set[str] | None = None,
+    ) -> int:
+        """Delete this file's chunks unless another stored file references them."""
+        referenced_chunk_hashes = referenced_chunk_hashes or set()
+        chunk_hashes = {
+            placement["chunk_hash"]
+            for placement in manifest["placements"]
+            if placement["chunk_hash"] not in referenced_chunk_hashes
+        }
+        deleted_copies = 0
+        for node in self.nodes:
+            for chunk_hash in chunk_hashes:
+                deleted_copies += node.delete_chunk(chunk_hash)
+        return deleted_copies
+
     def _get_node(self, node_id: str) -> Optional[StorageNode]:
         """Get a node by its ID."""
         for node in self.nodes:

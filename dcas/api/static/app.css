@@ -184,8 +184,10 @@ input::placeholder, textarea::placeholder { color: #b4bdc6; }
 .file-link:hover { color: var(--green); }
 .file-cid { display: block; max-width: 145px; overflow: hidden; margin-top: 4px; color: #a8b2bc; font-family: "DM Mono", monospace; font-size: 8px; text-overflow: ellipsis; }
 .owner-pill { display: inline-block; max-width: 100px; overflow: hidden; padding: 4px 7px; border-radius: 5px; background: #f3f5f7; color: #718093; text-overflow: ellipsis; }
-.row-action { display: inline-grid; width: 26px; height: 26px; place-items: center; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #9ca8b3; cursor: pointer; font-size: 15px; }
+.file-row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 3px; }
+.row-action { display: inline-grid; min-width: 26px; height: 26px; place-items: center; padding: 0 5px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #9ca8b3; cursor: pointer; font-size: 11px; }
 .row-action:hover { border-color: #dcece7; background: #f1faf6; color: var(--green); }
+.row-action-delete:hover { border-color: #f1dada; background: #fff3f3; color: #c15f64; }
 .panel-bottom { display: flex; min-height: 38px; align-items: center; justify-content: space-between; border-top: 1px solid #eff2f4; color: #a0aab5; font-size: 9px; }
 .text-link { color: var(--green); font-size: 10px; }
 .hidden { display: none !important; }

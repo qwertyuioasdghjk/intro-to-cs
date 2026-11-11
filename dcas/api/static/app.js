@@ -111,7 +111,14 @@ function renderFiles(files = allFiles) {
       action.setAttribute("aria-label", `View ${file.filename || "file"} details`);
       action.title = "View details and verify";
       action.addEventListener("click", () => openFile(file));
-      actionsCell.append(action);
+      const deleteButton = node("button", "row-action row-action-delete", "Delete");
+      deleteButton.type = "button";
+      deleteButton.setAttribute("aria-label", `Delete ${file.filename || "file"}`);
+      deleteButton.title = "Delete file";
+      deleteButton.addEventListener("click", () => deleteFile(file));
+      const rowActions = node("div", "file-row-actions");
+      rowActions.append(action, deleteButton);
+      actionsCell.append(rowActions);
       row.append(fileCell, sizeCell, ownerCell, dateCell, actionsCell);
       filesBody.append(row);
     }
@@ -304,6 +311,20 @@ async function changeNodeState(nodeId, isOnline, button) {
     showToast(`Could not update ${nodeId}: ${error.message}`, true);
   } finally {
     setLoading(button, false, isOnline ? "Take offline" : "Recover");
+  }
+}
+
+async function deleteFile(file) {
+  const filename = file.filename || "this file";
+  if (!window.confirm(`Delete "${filename}" from the network? This cannot be undone.`)) return;
+
+  try {
+    const result = await api(`/api/file/${encodeURIComponent(file.cid)}`, { method: "DELETE" });
+    if (selectedFile?.cid === file.cid && fileDialog.open) fileDialog.close();
+    showToast(result.message || `${filename} deleted.`);
+    await loadDashboard();
+  } catch (error) {
+    showToast(`Could not delete ${filename}: ${error.message}`, true);
   }
 }
 

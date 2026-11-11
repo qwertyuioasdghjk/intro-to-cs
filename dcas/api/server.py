@@ -28,6 +28,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 from ..storage.network import StorageNetwork
 from ..verifier.verifier import IntegrityVerifier
 from ..database.metadata import MetadataStore
+from ..database.mongo_metadata import MongoMetadataStore
 
 
 def create_app(
@@ -35,15 +36,19 @@ def create_app(
     db_path: str = "dcas_metadata.db",
     num_nodes: int = 4,
     replication_factor: int = 2,
+    mongodb_uri: str | None = None,
+    mongodb_database: str | None = None,
 ) -> Flask:
     """
     Create and configure the Flask application.
 
     Args:
         network_dir:        Base directory for storage nodes.
-        db_path:            Path to the SQLite database.
+        db_path:            Path to the SQLite database when MongoDB is not configured.
         num_nodes:          Number of storage nodes.
         replication_factor: Chunks are replicated to this many nodes.
+        mongodb_uri:        MongoDB URI; defaults to DCAS_MONGODB_URI.
+        mongodb_database:   MongoDB database name; defaults to DCAS_MONGODB_DATABASE or "dcas".
 
     Returns:
         A configured Flask app.
@@ -57,7 +62,17 @@ def create_app(
         replication_factor=replication_factor,
     )
     verifier = IntegrityVerifier(network)
-    metadata = MetadataStore(db_path)
+    mongodb_uri = mongodb_uri if mongodb_uri is not None else os.environ.get("DCAS_MONGODB_URI")
+    mongodb_database = (
+        mongodb_database
+        if mongodb_database is not None
+        else os.environ.get("DCAS_MONGODB_DATABASE", "dcas")
+    )
+    metadata = (
+        MongoMetadataStore(mongodb_uri, mongodb_database)
+        if mongodb_uri
+        else MetadataStore(db_path)
+    )
     app.extensions["dcas"] = {
         "network": network,
         "verifier": verifier,
@@ -315,11 +330,29 @@ def create_app(
 
     @app.route("/api/file/<cid>", methods=["DELETE"])
     def delete_file(cid):
-        """Delete a file's metadata."""
+        """Delete a file's metadata and chunks not shared by other files."""
+        manifest = metadata.get_manifest(cid)
+        if manifest is None:
+            return jsonify({"error": "File not found"}), 404
+
         success = metadata.delete_file(cid)
-        if success:
-            return jsonify({"message": f"File {cid} deleted."})
-        return jsonify({"error": "File not found"}), 404
+        if not success:
+            return jsonify({"error": "File not found"}), 404
+
+        referenced_chunk_hashes = set()
+        for stored_file in metadata.list_files():
+            stored_manifest = metadata.get_manifest(stored_file["cid"])
+            if stored_manifest is not None:
+                referenced_chunk_hashes.update(
+                    placement["chunk_hash"]
+                    for placement in stored_manifest["placements"]
+                )
+
+        deleted_copies = network.delete_file_chunks(manifest, referenced_chunk_hashes)
+        return jsonify({
+            "message": f"File {cid} deleted.",
+            "deleted_chunk_copies": deleted_copies,
+        })
 
     # ── Search ──────────────────────────────────────────────────────
 

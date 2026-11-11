@@ -5,6 +5,9 @@ Usage:
     python -m dcas.run_server
     python -m dcas.run_server --port 8080
     python -m dcas.run_server --nodes 6 --replication 3
+
+Set DCAS_MONGODB_URI to use MongoDB for metadata and audit logs.
+Otherwise, the server uses the SQLite database selected by --db.
 """
 
 import argparse
@@ -39,6 +42,7 @@ def main():
     print(f"Dashboard:    http://{display_host}:{args.port}/")
     print(f"API endpoints: http://{display_host}:{args.port}/api/...")
     print(f"Storage nodes: {args.nodes} (replication factor {args.replication})")
+    print(f"Metadata DB:  {'MongoDB' if os.environ.get('DCAS_MONGODB_URI') else args.db}")
 
     app.run(host=args.host, port=args.port, debug=False)
 

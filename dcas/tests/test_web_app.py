@@ -1,7 +1,9 @@
+import io
 import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from dcas.api.server import create_app
 
@@ -14,6 +16,7 @@ class TestWebApp(unittest.TestCase):
             db_path=os.path.join(self.test_dir, "metadata.db"),
             num_nodes=2,
             replication_factor=1,
+            mongodb_uri="",
         )
         self.app.testing = True
         self.client = self.app.test_client()
@@ -37,6 +40,8 @@ class TestWebApp(unittest.TestCase):
         self.assertIn(b".app-shell", stylesheet.data)
         self.assertEqual(script.status_code, 200)
         self.assertIn(b"loadDashboard", script.data)
+        self.assertIn(b"Delete file", script.data)
+        self.assertIn(b"method: \"DELETE\"", script.data)
 
     def test_dashboard_file_upload_and_verification_workflow(self):
         upload = self.client.post(
@@ -80,6 +85,64 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(recovered.status_code, 200)
         status_after_recovery = self.client.get("/api/network/status").get_json()
         self.assertEqual(status_after_recovery["online_nodes"], 2)
+
+    def test_delete_file_removes_unshared_chunks_and_keeps_shared_chunks(self):
+        shared_chunk = b"S" * (256 * 1024)
+        first_upload = self.client.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(shared_chunk + b"first"), "first.bin")},
+            content_type="multipart/form-data",
+        )
+        second_upload = self.client.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(shared_chunk + b"second"), "second.bin")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(first_upload.status_code, 201)
+        self.assertEqual(second_upload.status_code, 201)
+
+        first_cid = first_upload.get_json()["cid"]
+        second_cid = second_upload.get_json()["cid"]
+        metadata = self.app.extensions["dcas"]["metadata"]
+        network = self.app.extensions["dcas"]["network"]
+        first_manifest = metadata.get_manifest(first_cid)
+        shared_hash = first_manifest["placements"][0]["chunk_hash"]
+        unique_hash = first_manifest["placements"][1]["chunk_hash"]
+
+        response = self.client.delete(f"/api/file/{first_cid}")
+        self.assertEqual(response.status_code, 200)
+        self.assertGreater(response.get_json()["deleted_chunk_copies"], 0)
+        self.assertEqual(self.client.get(f"/api/file/{first_cid}").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/file/{second_cid}").status_code, 200)
+        self.assertIsNotNone(network.retrieve_file(metadata.get_manifest(second_cid)))
+        self.assertTrue(any(node.has_chunk(shared_hash) for node in network.nodes))
+        self.assertFalse(any(node.has_chunk(unique_hash) for node in network.nodes))
+
+    def test_mongodb_environment_selects_mongodb_metadata_store(self):
+        test_dir = tempfile.mkdtemp()
+        try:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "DCAS_MONGODB_URI": "mongodb://example.invalid",
+                        "DCAS_MONGODB_DATABASE": "dcas_test",
+                    },
+                ),
+                patch("dcas.api.server.MongoMetadataStore") as mongo_store,
+            ):
+                app = create_app(
+                    network_dir=os.path.join(test_dir, "network"),
+                    db_path=os.path.join(test_dir, "metadata.db"),
+                    num_nodes=2,
+                    replication_factor=1,
+                )
+
+            mongo_store.assert_called_once_with("mongodb://example.invalid", "dcas_test")
+            self.assertIs(app.extensions["dcas"]["metadata"], mongo_store.return_value)
+            app.extensions["dcas"]["network"].cleanup()
+        finally:
+            shutil.rmtree(test_dir)
 
 
 if __name__ == "__main__":
