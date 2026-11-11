@@ -77,7 +77,8 @@ class StorageNode:
         if not self.is_online:
             return False
 
-        if self.capacity > 0 and self.used_space + len(data) > self.capacity:
+        existing_size = self._metadata.get(chunk_hash, {}).get("size", 0)
+        if self.capacity > 0 and self.used_space - existing_size + len(data) > self.capacity:
             return False
 
         chunk_path = os.path.join(self.storage_dir, chunk_hash)

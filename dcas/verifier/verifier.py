@@ -113,9 +113,19 @@ class IntegrityVerifier:
         file_data = self.network.retrieve_file(manifest)
         if file_data is None:
             elapsed = (time.time() - start) * 1000
+            chunk_result = self.verify_chunks(manifest)
+            has_corruption = any(
+                chunk["status"] == "FAILED"
+                for chunk in chunk_result.details.get("chunks", [])
+            )
             return VerificationResult(
-                status=VerificationStatus.ERROR,
-                message="Could not retrieve all chunks from the network.",
+                status=VerificationStatus.FAILED if has_corruption else VerificationStatus.ERROR,
+                message=(
+                    "INTEGRITY VIOLATION: Stored chunk data does not match expected hashes."
+                    if has_corruption
+                    else "Could not retrieve all chunks from the network."
+                ),
+                details=chunk_result.details,
                 cid=cid_str,
                 elapsed_ms=elapsed,
             )
@@ -171,40 +181,45 @@ class IntegrityVerifier:
         for placement in manifest["placements"]:
             chunk_hash = placement["chunk_hash"]
             chunk_data = None
+            actual_hash = None
 
-            # Try to retrieve from any node
+            # Prefer any healthy copy over corrupted replicas.
             for node_id in placement["stored_on"]:
                 node = self.network._get_node(node_id)
                 if node:
-                    chunk_data = node.retrieve_chunk(chunk_hash)
-                    if chunk_data is not None:
+                    candidate = node.retrieve_chunk(chunk_hash)
+                    if candidate is None:
+                        continue
+                    candidate_hash = self.engine.hash_bytes(candidate)
+                    if candidate_hash == chunk_hash:
+                        chunk_data = candidate
                         break
+                    actual_hash = candidate_hash
 
             if chunk_data is None:
-                chunk_results.append({
-                    "chunk_index": placement["chunk_index"],
-                    "status": "MISSING",
-                    "expected_hash": chunk_hash,
-                })
+                if actual_hash is None:
+                    chunk_results.append({
+                        "chunk_index": placement["chunk_index"],
+                        "status": "MISSING",
+                        "expected_hash": chunk_hash,
+                    })
+                else:
+                    chunk_results.append({
+                        "chunk_index": placement["chunk_index"],
+                        "status": "FAILED",
+                        "expected_hash": chunk_hash,
+                        "actual_hash": actual_hash,
+                    })
                 all_passed = False
-                missing_chunks += 1
+                if actual_hash is None:
+                    missing_chunks += 1
                 continue
 
-            actual_hash = self.engine.hash_bytes(chunk_data)
-            if actual_hash == chunk_hash:
-                chunk_results.append({
-                    "chunk_index": placement["chunk_index"],
-                    "status": "PASSED",
-                    "hash": chunk_hash,
-                })
-            else:
-                chunk_results.append({
-                    "chunk_index": placement["chunk_index"],
-                    "status": "FAILED",
-                    "expected_hash": chunk_hash,
-                    "actual_hash": actual_hash,
-                })
-                all_passed = False
+            chunk_results.append({
+                "chunk_index": placement["chunk_index"],
+                "status": "PASSED",
+                "hash": chunk_hash,
+            })
 
         elapsed = (time.time() - start) * 1000
 

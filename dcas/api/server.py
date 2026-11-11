@@ -107,7 +107,10 @@ def create_app(
         file_data = file.read()
 
         # Store in network
-        manifest = network.store_bytes(file_data, filename=file.filename)
+        try:
+            manifest = network.store_bytes(file_data, filename=file.filename)
+        except RuntimeError as error:
+            return jsonify({"error": str(error)}), 503
 
         # Store manifest in metadata DB
         metadata.store_manifest(manifest, owner=owner, tags=tags)
@@ -128,15 +131,22 @@ def create_app(
     @app.route("/api/upload/text", methods=["POST"])
     def upload_text():
         """Upload text content directly."""
-        data = request.get_json()
-        if not data or "content" not in data:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or "content" not in data:
             return jsonify({"error": "Missing 'content' field"}), 400
+        if not isinstance(data["content"], str):
+            return jsonify({"error": "'content' must be a string"}), 400
 
         content = data["content"].encode("utf-8")
         filename = data.get("filename", "text_upload.txt")
         owner = data.get("owner", "system")
+        if not isinstance(filename, str) or not isinstance(owner, str):
+            return jsonify({"error": "'filename' and 'owner' must be strings"}), 400
 
-        manifest = network.store_bytes(content, filename=filename)
+        try:
+            manifest = network.store_bytes(content, filename=filename)
+        except RuntimeError as error:
+            return jsonify({"error": str(error)}), 503
         metadata.store_manifest(manifest, owner=owner)
 
         return jsonify({

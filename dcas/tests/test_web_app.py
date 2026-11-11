@@ -72,6 +72,26 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(audit.status_code, 200)
         self.assertGreaterEqual(audit.get_json()["stats"]["total_events"], 2)
 
+    def test_text_upload_accepts_empty_content_and_rejects_invalid_content(self):
+        upload = self.client.post("/api/upload/text", json={"content": ""})
+        self.assertEqual(upload.status_code, 201)
+
+        cid = upload.get_json()["cid"]
+        verification = self.client.post(f"/api/verify/{cid}")
+        self.assertEqual(verification.get_json()["status"], "PASSED")
+
+        invalid = self.client.post("/api/upload/text", json={"content": 123})
+        self.assertEqual(invalid.status_code, 400)
+
+    def test_text_upload_reports_unavailable_storage(self):
+        for node in self.app.extensions["dcas"]["network"].nodes:
+            node.capacity = 1
+
+        response = self.client.post("/api/upload/text", json={"content": "too large"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.client.get("/api/files").get_json()["count"], 0)
+
     def test_dashboard_node_controls_update_network_status(self):
         initial_status = self.client.get("/api/network/status").get_json()
         node_id = initial_status["nodes"][0]["node_id"]

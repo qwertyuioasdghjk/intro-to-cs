@@ -36,6 +36,9 @@ class StorageNetwork:
         replication_factor: int = 2,
         algorithm: HashAlgorithm = HashAlgorithm.SHA256,
     ):
+        if replication_factor < 1:
+            raise ValueError("Replication factor must be positive.")
+
         self.base_dir = os.path.abspath(base_dir)
         self.replication_factor = replication_factor
         self.algorithm = algorithm
@@ -70,14 +73,13 @@ class StorageNetwork:
         """Return all nodes that are currently online."""
         return [n for n in self.nodes if n.is_online]
 
-    def _select_nodes_for_storage(self, count: int) -> list[StorageNode]:
-        """Select nodes for storing a chunk, preferring nodes with less data."""
+    def _select_nodes_for_storage(self, chunk_hash: str) -> list[StorageNode]:
+        """Order online nodes by used space so capacity failures can fall through."""
         online = self.get_online_nodes()
         if not online:
             raise RuntimeError("No online nodes available in the network.")
-        # Sort by used space (ascending) and pick the lightest-loaded nodes
-        online.sort(key=lambda n: n.used_space)
-        return online[: min(count, len(online))]
+        online.sort(key=lambda n: (not n.has_chunk(chunk_hash), n.used_space))
+        return online
 
     # ── File operations ─────────────────────────────────────────────
 
@@ -130,18 +132,35 @@ class StorageNetwork:
 
         # 4. Distribute chunks across nodes
         placements: list[dict] = []
-        for chunk in chunks:
-            target_nodes = self._select_nodes_for_storage(self.replication_factor)
-            stored_on = []
-            for node in target_nodes:
-                if node.store_chunk(chunk.hash, chunk.data):
-                    stored_on.append(node.node_id)
-            placements.append({
-                "chunk_index": chunk.index,
-                "chunk_hash": chunk.hash,
-                "chunk_size": chunk.size,
-                "stored_on": stored_on,
-            })
+        newly_stored: list[tuple[StorageNode, str]] = []
+        try:
+            for chunk in chunks:
+                stored_on = []
+                for node in self._select_nodes_for_storage(chunk.hash):
+                    if len(stored_on) >= self.replication_factor:
+                        break
+                    already_present = node.has_chunk(chunk.hash)
+                    if node.store_chunk(chunk.hash, chunk.data):
+                        stored_on.append(node.node_id)
+                        if not already_present:
+                            newly_stored.append((node, chunk.hash))
+
+                if len(stored_on) < self.replication_factor:
+                    raise RuntimeError(
+                        f"Could not store chunk {chunk.index} on "
+                        f"{self.replication_factor} nodes."
+                    )
+
+                placements.append({
+                    "chunk_index": chunk.index,
+                    "chunk_hash": chunk.hash,
+                    "chunk_size": chunk.size,
+                    "stored_on": stored_on,
+                })
+        except Exception:
+            for node, chunk_hash in reversed(newly_stored):
+                node.delete_chunk(chunk_hash)
+            raise
 
         manifest = {
             "cid": cid.to_dict(),
@@ -173,19 +192,15 @@ class StorageNetwork:
             chunk_hash = placement["chunk_hash"]
             chunk_data = None
 
-            # Try each node that stores this chunk
-            for node_id in placement["stored_on"]:
+            candidate_node_ids = placement["stored_on"] + [
+                node.node_id for node in self.get_online_nodes()
+            ]
+            for node_id in dict.fromkeys(candidate_node_ids):
                 node = self._get_node(node_id)
                 if node:
-                    chunk_data = node.retrieve_chunk(chunk_hash)
-                    if chunk_data is not None:
-                        break
-
-            # Fallback: try all online nodes
-            if chunk_data is None:
-                for node in self.get_online_nodes():
-                    chunk_data = node.retrieve_chunk(chunk_hash)
-                    if chunk_data is not None:
+                    candidate = node.retrieve_chunk(chunk_hash)
+                    if candidate is not None and self.chunker.engine.verify_bytes(candidate, chunk_hash):
+                        chunk_data = candidate
                         break
 
             if chunk_data is None:

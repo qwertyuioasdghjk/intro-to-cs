@@ -142,6 +142,14 @@ class TestFileChunker(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0].data, b"Small data")
 
+    def test_chunk_empty_data(self):
+        """Empty data is represented by one empty chunk."""
+        chunker = FileChunker(chunk_size=1024)
+        chunks = chunker.chunk_bytes(b"")
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].data, b"")
+        self.assertEqual(chunks[0].size, 0)
+
     def test_chunk_exact_multiple(self):
         """Data that's an exact multiple of chunk size."""
         chunker = FileChunker(chunk_size=10)
@@ -340,6 +348,47 @@ class TestStorageNetwork(unittest.TestCase):
         manifest = self.network.store_bytes(data, filename="test.txt")
         retrieved = self.network.retrieve_file(manifest)
         self.assertEqual(retrieved, data)
+
+    def test_empty_data_round_trip(self):
+        """Empty content can be stored and retrieved."""
+        manifest = self.network.store_bytes(b"")
+        self.assertEqual(self.network.retrieve_file(manifest), b"")
+
+    def test_retrieve_uses_healthy_replica_after_corruption(self):
+        """A corrupted replica is skipped when another copy is healthy."""
+        data = b"Replicated data"
+        manifest = self.network.store_bytes(data)
+        placement = manifest["placements"][0]
+        first_node = self.network._get_node(placement["stored_on"][0])
+        self.assertIsNotNone(first_node)
+        first_node.store_chunk(placement["chunk_hash"], b"corrupted data")
+
+        self.assertEqual(self.network.retrieve_file(manifest), data)
+        result = IntegrityVerifier(self.network).verify_file_integrity(manifest)
+        self.assertEqual(result.status, VerificationStatus.PASSED)
+
+    def test_insufficient_replication_rolls_back_new_chunks(self):
+        """Failed replication leaves no partial chunks on the nodes."""
+        self.network.chunker.chunk_size = 4
+        for node in self.network.nodes:
+            node.capacity = 4
+
+        with self.assertRaises(RuntimeError):
+            self.network.store_bytes(b"123456789012")
+
+        for node in self.network.nodes:
+            self.assertEqual(node.list_chunks(), [])
+
+    def test_repeated_chunk_does_not_consume_capacity_twice(self):
+        """Identical content-addressed chunks reuse their stored bytes."""
+        self.network.chunker.chunk_size = 4
+        for node in self.network.nodes:
+            node.capacity = 4
+
+        manifest = self.network.store_bytes(b"abcdabcd")
+
+        self.assertEqual(self.network.retrieve_file(manifest), b"abcdabcd")
+        self.assertEqual([node.used_space for node in self.network.nodes], [4, 4, 0, 0])
 
     def test_manifest_structure(self):
         """Manifest has required fields."""

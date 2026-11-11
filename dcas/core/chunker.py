@@ -77,6 +77,15 @@ class FileChunker:
         Returns:
             A list of Chunk objects.
         """
+        if not data:
+            return [Chunk(
+                index=0,
+                data=b"",
+                hash=self.engine.hash_bytes(b""),
+                offset=0,
+                size=0,
+            )]
+
         chunks = []
         offset = 0
         index = 0
@@ -128,6 +137,14 @@ class FileChunker:
             while True:
                 chunk_data = f.read(self.chunk_size)
                 if not chunk_data:
+                    if index == 0:
+                        yield Chunk(
+                            index=0,
+                            data=b"",
+                            hash=self.engine.hash_bytes(b""),
+                            offset=0,
+                            size=0,
+                        )
                     break
                 chunk_hash = self.engine.hash_bytes(chunk_data)
                 yield Chunk(
