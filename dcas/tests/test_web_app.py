@@ -31,6 +31,7 @@ class TestWebApp(unittest.TestCase):
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
         self.assertIn(b"Your files.", page.data)
+        self.assertIn(b"Have an access link?", page.data)
         self.assertIn(b"/static/app.css", page.data)
         self.assertIn(b"/static/app.js", page.data)
 
@@ -146,6 +147,7 @@ class TestWebApp(unittest.TestCase):
         reader_list = self.client.get(f"/api/spaces/{space_id}/files", headers=reader_headers)
         self.assertEqual(reader_list.status_code, 200)
         self.assertEqual(reader_list.get_json()["count"], 1)
+        self.assertFalse(reader_list.get_json()["can_upload"])
         self.assertNotIn(cid, [item["cid"] for item in self.client.get("/api/files").get_json()["files"]])
         self.assertEqual(self.client.get(f"/api/file/{cid}").status_code, 404)
         self.assertEqual(self.client.get(f"/api/download/{cid}").status_code, 404)
@@ -166,6 +168,11 @@ class TestWebApp(unittest.TestCase):
             self.client.get(f"/api/spaces/{space_id}/files/{cid}/download", headers=reader_headers).data,
             ciphertext,
         )
+        verification = self.client.post(
+            f"/api/spaces/{space_id}/files/{cid}/verify",
+            headers=reader_headers,
+        )
+        self.assertEqual(verification.get_json()["status"], "PASSED")
 
         rotated = self.client.post(
             f"/api/spaces/{space_id}/link/rotate",
@@ -177,6 +184,32 @@ class TestWebApp(unittest.TestCase):
 
         self.assertEqual(self.client.delete(f"/api/spaces/{space_id}/link", headers=admin_headers).status_code, 200)
         self.assertEqual(self.client.get(f"/api/spaces/{space_id}/files", headers=new_reader_headers).status_code, 404)
+
+    def test_shared_space_owner_can_enable_link_uploads(self):
+        created = self.client.post(
+            "/api/spaces",
+            json={"name": "Collaborative space", "allow_upload": True},
+        )
+        self.assertEqual(created.status_code, 201)
+        space = created.get_json()
+        space_id = space["space_id"]
+        reader_headers = {"Authorization": f"Bearer {space['share_token']}"}
+
+        listing = self.client.get(f"/api/spaces/{space_id}/files", headers=reader_headers)
+        self.assertTrue(listing.get_json()["can_upload"])
+        upload = self.client.post(
+            f"/api/spaces/{space_id}/files",
+            headers=reader_headers,
+            data={"file": (io.BytesIO(b"DCAS1" + b"\x00" * 12 + b"encrypted"), "member-upload.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(upload.status_code, 201)
+        cid = upload.get_json()["cid"]
+        verify = self.client.post(
+            f"/api/spaces/{space_id}/files/{cid}/verify",
+            headers=reader_headers,
+        )
+        self.assertEqual(verify.get_json()["status"], "PASSED")
 
     def test_delete_file_removes_unshared_chunks_and_keeps_shared_chunks(self):
         shared_chunk = b"S" * (256 * 1024)

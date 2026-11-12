@@ -62,9 +62,15 @@ class MetadataStore:
                 name                TEXT NOT NULL,
                 admin_token_hash    TEXT NOT NULL,
                 share_token_hash    TEXT,
+                allow_upload        INTEGER NOT NULL DEFAULT 0,
                 created_at          TEXT NOT NULL
             )
         """)
+        space_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(shared_spaces)")}
+        if "allow_upload" not in space_columns:
+            cursor.execute(
+                "ALTER TABLE shared_spaces ADD COLUMN allow_upload INTEGER NOT NULL DEFAULT 0"
+            )
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -198,15 +204,16 @@ class MetadataStore:
         name: str,
         admin_token_hash: str,
         share_token_hash: str,
+        allow_upload: bool = False,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         self.conn.execute(
             """
             INSERT INTO shared_spaces
-                (space_id, name, admin_token_hash, share_token_hash, created_at)
-            VALUES (?, ?, ?, ?, ?)
+                (space_id, name, admin_token_hash, share_token_hash, allow_upload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (space_id, name, admin_token_hash, share_token_hash, now),
+            (space_id, name, admin_token_hash, share_token_hash, int(allow_upload), now),
         )
         self.conn.commit()
 

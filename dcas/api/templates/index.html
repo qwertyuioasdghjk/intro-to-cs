@@ -61,6 +61,20 @@
           </div>
         </section>
 
+        <section class="panel access-entry">
+          <div>
+            <p class="eyebrow">JOIN A SHARED SPACE</p>
+            <h2>Have an access link?</h2>
+            <p class="welcome-copy">Paste the complete link from the owner to open the shared files.</p>
+          </div>
+          <form id="access-link-form" class="access-link-form">
+            <label class="visually-hidden" for="access-link-input">Shared-space access link</label>
+            <input id="access-link-input" type="text" required autocomplete="url" placeholder="Paste the shared-space link">
+            <button class="button button-primary" type="submit">Open shared space <span>↗</span></button>
+          </form>
+          <p id="access-link-error" class="access-link-error" role="status" aria-live="polite"></p>
+        </section>
+
         <section class="stat-grid" aria-label="Storage summary">
           <article class="stat-card">
             <div class="stat-top"><span class="stat-icon mint">▤</span><span class="stat-label">Stored files</span></div>
@@ -160,6 +174,12 @@
               <label class="field-label" for="space-name">Create a storage space
                 <input id="space-name" name="name" type="text" maxlength="120" required placeholder="e.g. Project research">
               </label>
+              <label class="field-label" for="space-permission">Link permissions
+                <select id="space-permission" name="permission">
+                  <option value="read_only">Read, verify, and download</option>
+                  <option value="read_write">All above, plus upload</option>
+                </select>
+              </label>
               <button class="button button-primary" type="submit">＋ Create encrypted space</button>
             </form>
             <form id="space-upload-form" class="space-form">
@@ -184,11 +204,17 @@
   </div>
 
   <main id="shared-view" class="shared-view hidden">
-    <header class="shared-header"><a class="brand shared-brand" href="/"><span class="brand-mark" aria-hidden="true">D</span><span><strong>DCAS</strong><small>Encrypted shared storage</small></span></a><span class="live-pill"><span class="status-dot"></span> Read-only access</span></header>
+    <header class="shared-header"><a class="brand shared-brand" href="/"><span class="brand-mark" aria-hidden="true">D</span><span><strong>DCAS</strong><small>Encrypted shared storage</small></span></a><span class="live-pill"><span class="status-dot"></span><span id="shared-permission">Checking access…</span></span></header>
     <section class="panel shared-panel">
       <p class="eyebrow">DECENTRALIZED SHARED SPACE</p>
       <h1 id="shared-title">Opening secure space…</h1>
-      <p class="welcome-copy">Files are encrypted in the owner's browser. This access link can read and decrypt them, but cannot add or remove files.</p>
+      <p id="shared-description" class="welcome-copy">Files are encrypted in the owner's browser. Your link controls which actions are available.</p>
+      <form id="shared-upload-form" class="shared-upload hidden">
+        <label class="field-label" for="shared-upload-file">Upload an encrypted file
+          <input id="shared-upload-file" type="file" required>
+        </label>
+        <button class="button button-primary" type="submit">Encrypt and upload</button>
+      </form>
       <div id="shared-files" class="shared-files" role="status" aria-live="polite"><div class="empty-state">Checking your access link…</div></div>
     </section>
   </main>

@@ -9,6 +9,7 @@ const toastRegion = $("#toast-region");
 let allFiles = [];
 let selectedFile = null;
 let refreshInProgress = false;
+let activeSharedAccess = null;
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
@@ -399,7 +400,9 @@ function renderOwnedSpaces() {
     copyButton.addEventListener("click", async () => {
       try {
         await navigator.clipboard.writeText(sharedAccessUrl(space));
-        showToast("Read-only access link copied. Anyone with it can read and decrypt this space.");
+        showToast(space.allow_upload
+          ? "Access link copied. Anyone with it can read and upload encrypted files."
+          : "Read-only access link copied. Anyone with it can read and decrypt this space.");
       } catch (error) {
         showToast(`Could not copy the access link: ${error.message}`, true);
       }
@@ -419,7 +422,8 @@ function renderOwnedSpaces() {
     api(`/api/spaces/${encodeURIComponent(space.space_id)}/files`, {
       headers: { Authorization: `Bearer ${space.admin_token}` }
     }).then((result) => {
-      status.textContent = `${result.count} ${result.count === 1 ? "file" : "files"} · ${space.share_token ? "access link active" : "link revoked"}`;
+      const permissions = space.allow_upload ? "read/write link" : "read-only link";
+      status.textContent = `${result.count} ${result.count === 1 ? "file" : "files"} · ${space.share_token ? permissions : "link revoked"}`;
     }).catch((error) => {
       status.textContent = `Could not load space: ${error.message}`;
     });
@@ -475,7 +479,10 @@ async function createSharedSpace(event) {
     const result = await api("/api/spaces", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: nameInput.value.trim() })
+      body: JSON.stringify({
+        name: nameInput.value.trim(),
+        allow_upload: $("#space-permission").value === "read_write"
+      })
     });
     const key = window.crypto.getRandomValues(new Uint8Array(32));
     const spaces = readOwnedSpaces();
@@ -484,12 +491,13 @@ async function createSharedSpace(event) {
       name: result.name,
       admin_token: result.admin_token,
       share_token: result.share_token,
+      allow_upload: result.allow_upload,
       key: bytesToBase64Url(key)
     });
     saveOwnedSpaces(spaces);
     event.target.reset();
     renderOwnedSpaces();
-    showToast("Encrypted space created. Copy its access link to invite readers.");
+    showToast(`Encrypted space created with ${result.allow_upload ? "read/write" : "read-only"} link access.`);
   } catch (error) {
     showToast(`Could not create the space: ${error.message}`, true);
   } finally {
@@ -513,16 +521,7 @@ async function uploadToSharedSpace(event) {
   const button = event.submitter;
   setLoading(button, true, "Encrypting and uploading…");
   try {
-    const keyBytes = base64UrlToBytes(space.key);
-    const cryptoKey = await window.crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
-    const iv = window.crypto.getRandomValues(new Uint8Array(12));
-    const encrypted = new Uint8Array(await window.crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
-      cryptoKey,
-      await file.arrayBuffer()
-    ));
-    const payload = new Blob([new TextEncoder().encode("DCAS1"), iv, encrypted], { type: "application/octet-stream" });
-    const encryptedFile = new File([payload], file.name, { type: "application/octet-stream" });
+    const encryptedFile = await encryptSharedFile(file, space.key);
     const formData = new FormData();
     formData.append("file", encryptedFile, file.name);
     const result = await api(`/api/spaces/${encodeURIComponent(space.space_id)}/files`, {
@@ -540,6 +539,82 @@ async function uploadToSharedSpace(event) {
   }
 }
 
+async function encryptSharedFile(file, encodedKey) {
+  const keyBytes = base64UrlToBytes(encodedKey);
+  const cryptoKey = await window.crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+  const iv = window.crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = new Uint8Array(await window.crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    cryptoKey,
+    await file.arrayBuffer()
+  ));
+  const payload = new Blob([new TextEncoder().encode("DCAS1"), iv, encrypted], { type: "application/octet-stream" });
+  return new File([payload], file.name, { type: "application/octet-stream" });
+}
+
+function openAccessLink(event) {
+  event.preventDefault();
+  const errorOutput = $("#access-link-error");
+  errorOutput.textContent = "";
+  try {
+    const url = new URL($("#access-link-input").value.trim());
+    const access = new URLSearchParams(url.hash.slice(1));
+    if (
+      url.origin !== window.location.origin
+      || !/^\/share\/[A-Za-z0-9_-]+$/.test(url.pathname)
+      || !access.get("access")
+      || !access.get("key")
+    ) {
+      throw new Error("Paste a complete shared-space link from this DCAS site.");
+    }
+    window.location.assign(url.href);
+  } catch (error) {
+    errorOutput.textContent = error.message || "That access link is not valid.";
+  }
+}
+
+async function loadSharedSpaceFiles() {
+  const { spaceId, token, key } = activeSharedAccess;
+  const result = await api(`/api/spaces/${encodeURIComponent(spaceId)}/files`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  const canUpload = Boolean(result.can_upload);
+  $("#shared-title").textContent = result.name;
+  $("#shared-permission").textContent = canUpload ? "Read and upload" : "Read-only access";
+  $("#shared-description").textContent = canUpload
+    ? "This link can view, verify, download, and add encrypted files."
+    : "This link can view, verify, and download files. Only the owner can upload.";
+  $("#shared-upload-form").classList.toggle("hidden", !canUpload);
+
+  const sharedFiles = $("#shared-files");
+  sharedFiles.replaceChildren();
+  if (!result.files.length) {
+    sharedFiles.append(node("div", "empty-state", "This space does not contain any files yet."));
+    return;
+  }
+
+  for (const file of result.files) {
+    const row = node("article", "shared-file-row");
+    const info = node("div");
+    const status = node("span", "shared-file-status");
+    info.append(
+      node("div", "shared-file-name", file.filename),
+      node("div", "shared-file-meta", `${formatBytes(file.total_size)} · Encrypted on the storage network`),
+      status
+    );
+    const actions = node("div", "shared-file-actions");
+    const verify = node("button", "button button-secondary", "Verify integrity");
+    verify.type = "button";
+    verify.addEventListener("click", () => verifySharedFile(spaceId, file, token, verify, status));
+    const download = node("button", "button button-secondary", "Decrypt and download");
+    download.type = "button";
+    download.addEventListener("click", () => downloadSharedFile(spaceId, file, token, key, download));
+    actions.append(verify, download);
+    row.append(info, actions);
+    sharedFiles.append(row);
+  }
+}
+
 async function openSharedSpace() {
   $(".app-shell").classList.add("hidden");
   $("#shared-view").classList.remove("hidden");
@@ -550,38 +625,84 @@ async function openSharedSpace() {
   const sharedFiles = $("#shared-files");
   if (!token || !key) {
     $("#shared-title").textContent = "Access link is incomplete";
-    sharedFiles.replaceChildren(node("div", "empty-state", "Ask the space owner for a new access link."));
+    sharedFiles.replaceChildren(node("div", "empty-state", "Paste a complete link on the dashboard or ask the owner for a new one."));
     return;
   }
 
   const spaceId = decodeURIComponent(window.location.pathname.split("/").pop());
+  activeSharedAccess = { spaceId, token, key };
   try {
-    const result = await api(`/api/spaces/${encodeURIComponent(spaceId)}/files`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    $("#shared-title").textContent = result.name;
-    sharedFiles.replaceChildren();
-    if (!result.files.length) {
-      sharedFiles.append(node("div", "empty-state", "This space does not contain any files yet."));
-      return;
-    }
-
-    for (const file of result.files) {
-      const row = node("article", "shared-file-row");
-      const info = node("div");
-      info.append(
-        node("div", "shared-file-name", file.filename),
-        node("div", "shared-file-meta", `${formatBytes(file.total_size)} · Encrypted on the storage network`)
-      );
-      const download = node("button", "button button-secondary", "Decrypt and download");
-      download.type = "button";
-      download.addEventListener("click", () => downloadSharedFile(spaceId, file, token, key, download));
-      row.append(info, download);
-      sharedFiles.append(row);
-    }
+    await loadSharedSpaceFiles();
   } catch (error) {
     $("#shared-title").textContent = "Could not open this space";
     sharedFiles.replaceChildren(node("div", "empty-state", `Access failed: ${error.message}. Ask the owner for a current link.`));
+  }
+}
+
+async function verifySharedFile(spaceId, file, token, button, status) {
+  setLoading(button, true, "Verifying…");
+  status.className = "shared-file-status";
+  status.textContent = "";
+  try {
+    const result = await api(`/api/spaces/${encodeURIComponent(spaceId)}/files/${encodeURIComponent(file.cid)}/verify`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const passed = result.status === "PASSED";
+    status.classList.toggle("failure", !passed);
+    status.textContent = `${passed ? "Integrity verified" : "Integrity check failed"}: ${result.message || "Check complete."}`;
+    showToast(`${file.filename}: ${passed ? "integrity verified" : "integrity check failed"}.`, !passed);
+  } catch (error) {
+    status.classList.add("failure");
+    status.textContent = `Verification failed: ${error.message}`;
+    showToast(`Could not verify ${file.filename}: ${error.message}`, true);
+  } finally {
+    setLoading(button, false, "Verify integrity");
+  }
+}
+
+async function uploadToSharedSpaceFromLink(event) {
+  event.preventDefault();
+  if (!activeSharedAccess) return;
+  const file = $("#shared-upload-file").files[0];
+  if (!file) {
+    showToast("Choose a file to upload.", true);
+    return;
+  }
+  if (!window.crypto?.subtle) {
+    showToast("Browser encryption requires HTTPS or localhost and Web Crypto support.", true);
+    return;
+  }
+  const button = event.submitter;
+  setLoading(button, true, "Encrypting and uploading…");
+  let uploadedName = "";
+  try {
+    const encryptedFile = await encryptSharedFile(file, activeSharedAccess.key);
+    const formData = new FormData();
+    formData.append("file", encryptedFile, file.name);
+    const response = await api(
+      `/api/spaces/${encodeURIComponent(activeSharedAccess.spaceId)}/files`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${activeSharedAccess.token}` },
+        body: formData
+      }
+    );
+    uploadedName = response.filename;
+    event.target.reset();
+  } catch (error) {
+    showToast(`Could not encrypt or upload the file: ${error.message}`, true);
+  } finally {
+    setLoading(button, false, "Encrypt and upload");
+  }
+
+  if (uploadedName) {
+    showToast(`${uploadedName} encrypted and added to the shared space.`);
+    try {
+      await loadSharedSpaceFiles();
+    } catch (error) {
+      showToast(`Upload succeeded, but the file list could not refresh: ${error.message}`, true);
+    }
   }
 }
 
@@ -736,6 +857,8 @@ document.querySelectorAll(".nav-link").forEach((link) => {
 
 $("#create-space-form").addEventListener("submit", createSharedSpace);
 $("#space-upload-form").addEventListener("submit", uploadToSharedSpace);
+$("#access-link-form").addEventListener("submit", openAccessLink);
+$("#shared-upload-form").addEventListener("submit", uploadToSharedSpaceFromLink);
 
 if (window.location.pathname.startsWith("/share/")) {
   openSharedSpace();

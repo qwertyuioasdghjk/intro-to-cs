@@ -100,6 +100,13 @@ h1, h2, p { margin-top: 0; }
 h1 { margin-bottom: 10px; font-family: Manrope, "DM Sans", sans-serif; font-size: clamp(29px, 3.2vw, 42px); font-weight: 700; letter-spacing: -.055em; line-height: 1.14; }
 h1 span { color: #7f8e9c; font-weight: 500; }
 .welcome-copy { max-width: 540px; margin: 0; color: #788697; font-size: 12px; line-height: 1.7; }
+.access-entry { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 1.05fr); align-items: center; gap: 8px 18px; margin: 8px 0 18px; padding: 16px 19px; }
+.access-entry h2 { margin-bottom: 5px; }
+.access-link-form { display: flex; gap: 8px; }
+.access-link-form input { width: 100%; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid #e5eaed; border-radius: 6px; outline: none; font-size: 11px; }
+.access-link-form input:focus { border-color: #89d8c6; box-shadow: 0 0 0 3px rgb(39 197 165 / 10%); }
+.access-link-error { grid-column: 2; min-height: 0; margin: 0; color: #b35358; font-size: 10px; }
+.access-link-error:not(:empty) { min-height: 14px; }
 .welcome-art { position: relative; width: 190px; height: 165px; flex: 0 0 auto; margin: 2px 52px 0 20px; }
 .orbit { position: absolute; top: 50%; left: 50%; border: 1px solid #dce8e7; border-radius: 50%; transform: translate(-50%, -50%) rotate(-24deg); }
 .orbit-one { width: 188px; height: 86px; }
@@ -272,7 +279,13 @@ input::placeholder, textarea::placeholder { color: #b4bdc6; }
 .shared-panel h1 { margin-bottom: 9px; font-size: 30px; }
 .shared-panel .welcome-copy { max-width: 620px; }
 .shared-files { margin-top: 23px; }
+.shared-upload { display: flex; align-items: flex-end; gap: 10px; margin-top: 20px; padding: 13px; border: 1px solid #edf0f2; border-radius: 8px; }
+.shared-upload .field-label { min-width: 0; flex: 1; }
+.shared-upload input { display: block; width: 100%; margin-top: 6px; font-size: 10px; }
 .shared-file-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 0; border-top: 1px solid #f0f3f5; }
+.shared-file-actions { display: flex; flex: 0 0 auto; gap: 7px; }
+.shared-file-status { display: block; margin-top: 4px; color: #148d72; font-size: 9px; }
+.shared-file-status.failure { color: #c15f64; }
 .shared-file-name { min-width: 0; overflow-wrap: anywhere; color: #435367; font-size: 11px; font-weight: 600; }
 .shared-file-meta { margin-top: 5px; color: #98a4af; font-size: 9px; }
 
@@ -324,6 +337,14 @@ input::placeholder, textarea::placeholder { color: #b4bdc6; }
   .live-pill .status-dot { width: 7px; height: 7px; }
   .page-content { padding: 21px 14px 18px; }
   .welcome-row { min-height: 170px; padding: 0; }
+  .access-entry { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px; }
+  .access-link-error { grid-column: 1; }
+  .access-link-form { flex-wrap: wrap; }
+  .access-link-form .button { width: 100%; }
+  .shared-upload { align-items: stretch; flex-direction: column; }
+  .shared-upload .button { align-self: flex-start; }
+  .shared-file-row { align-items: flex-start; flex-direction: column; }
+  .shared-file-actions { flex-wrap: wrap; }
   h1 { font-size: 31px; }
   .welcome-copy { max-width: 360px; padding-right: 3px; font-size: 11px; }
   .welcome-art { position: absolute; right: -53px; bottom: -2px; opacity: .46; transform: scale(.7); }

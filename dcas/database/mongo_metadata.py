@@ -105,12 +105,14 @@ class MongoMetadataStore:
         name: str,
         admin_token_hash: str,
         share_token_hash: str,
+        allow_upload: bool = False,
     ) -> None:
         self.shared_spaces.insert_one({
             "space_id": space_id,
             "name": name,
             "admin_token_hash": admin_token_hash,
             "share_token_hash": share_token_hash,
+            "allow_upload": allow_upload,
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
 

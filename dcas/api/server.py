@@ -6,7 +6,8 @@ Endpoints:
     POST   /api/upload         Upload a file
     POST   /api/spaces         Create a capability-protected shared space
     GET    /api/spaces/<id>/files       List shared-space files with an access token
-    POST   /api/spaces/<id>/files       Upload an encrypted file with the owner token
+    POST   /api/spaces/<id>/files       Upload an encrypted file with write access
+    POST   /api/spaces/<id>/files/<cid>/verify  Verify a shared-space file
     POST   /api/spaces/<id>/link/rotate Replace the read-only access link
     DELETE /api/spaces/<id>/link        Revoke the read-only access link
     GET    /api/files           List stored files
@@ -125,7 +126,7 @@ def create_app(
             return space, "admin"
         share_hash = space.get("share_token_hash")
         if share_hash and hmac.compare_digest(digest, share_hash):
-            return space, "reader"
+            return space, "writer" if space.get("allow_upload") else "reader"
         return space, None
 
     def private_file_response(cid: str):
@@ -142,6 +143,9 @@ def create_app(
         name = data["name"].strip()
         if not name or len(name) > 120:
             return jsonify({"error": "Space name must be between 1 and 120 characters"}), 400
+        allow_upload = data.get("allow_upload", False)
+        if not isinstance(allow_upload, bool):
+            return jsonify({"error": "'allow_upload' must be a boolean"}), 400
 
         space_id = secrets.token_urlsafe(18)
         admin_token = secrets.token_urlsafe(32)
@@ -151,6 +155,7 @@ def create_app(
             name,
             token_hash(admin_token),
             token_hash(share_token),
+            allow_upload=allow_upload,
         )
         metadata.log_event("SPACE_CREATE", details="Shared space created")
         return jsonify({
@@ -158,6 +163,7 @@ def create_app(
             "name": name,
             "admin_token": admin_token,
             "share_token": share_token,
+            "allow_upload": allow_upload,
         }), 201
 
     @app.route("/api/spaces/<space_id>/files", methods=["GET"])
@@ -166,13 +172,19 @@ def create_app(
         if space is None or access is None:
             return jsonify({"error": "Shared space not found or access denied"}), 404
         files = metadata.list_files(space_id=space_id)
-        return jsonify({"space_id": space_id, "name": space["name"], "files": files, "count": len(files)})
+        return jsonify({
+            "space_id": space_id,
+            "name": space["name"],
+            "files": files,
+            "count": len(files),
+            "can_upload": access in ("admin", "writer"),
+        })
 
     @app.route("/api/spaces/<space_id>/files", methods=["POST"])
     def upload_shared_space_file(space_id):
         space, access = get_space_access(space_id)
-        if space is None or access != "admin":
-            return jsonify({"error": "Shared space not found or owner access required"}), 404
+        if space is None or access not in ("admin", "writer"):
+            return jsonify({"error": "Shared space not found or write access required"}), 404
         if "file" not in request.files:
             return jsonify({"error": "No file part in request"}), 400
         file = request.files["file"]
@@ -216,6 +228,23 @@ def create_app(
             download_name=manifest["filename"],
             as_attachment=True,
         )
+
+    @app.route("/api/spaces/<space_id>/files/<cid>/verify", methods=["POST"])
+    def verify_shared_space_file(space_id, cid):
+        space, access = get_space_access(space_id)
+        info = metadata.get_file_info(cid)
+        if space is None or access is None or not info or info.get("space_id") != space_id:
+            return jsonify({"error": "File not found"}), 404
+        manifest = metadata.get_manifest(cid)
+        result = verifier.verify_file_integrity(manifest)
+        metadata.log_event(
+            "VERIFY",
+            cid,
+            manifest["filename"],
+            result.message,
+            status="success" if result.passed else "failure",
+        )
+        return jsonify(result.to_dict())
 
     @app.route("/api/spaces/<space_id>/link/rotate", methods=["POST"])
     def rotate_shared_space_link(space_id):
