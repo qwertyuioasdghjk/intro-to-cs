@@ -171,6 +171,40 @@ class MetadataStore:
             return json.loads(row["manifest_json"])
         return None
 
+    def update_shared_manifest(self, cid: str, manifest: dict) -> bool:
+        """Update a shared manifest without changing its public CID."""
+        cid_info = manifest["cid"]
+        cursor = self.conn.execute(
+            """
+            UPDATE files SET filename = ?, hash_digest = ?, algorithm = ?,
+                total_size = ?, chunk_count = ?, merkle_root = ?,
+                manifest_json = ?, source_fingerprint = ?, updated_at = ?
+            WHERE cid = ? AND space_id IS NOT NULL
+            """,
+            (
+                manifest["filename"],
+                cid_info["hash_digest"],
+                cid_info["algorithm"],
+                manifest["total_size"],
+                manifest["chunk_count"],
+                manifest["merkle_root"],
+                json.dumps(manifest),
+                manifest.get("source_fingerprint"),
+                datetime.now(timezone.utc).isoformat(),
+                cid,
+            ),
+        )
+        self.conn.commit()
+        if cursor.rowcount == 0:
+            return False
+        self.log_event(
+            "STORAGE_ENCRYPTION_MIGRATION",
+            cid,
+            manifest["filename"],
+            "Shared file migrated to encrypted storage",
+        )
+        return True
+
     def get_file_info(self, cid: str) -> Optional[dict]:
         """Retrieve full file metadata by CID."""
         cursor = self.conn.cursor()

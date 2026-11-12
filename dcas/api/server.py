@@ -80,7 +80,7 @@ def create_app(
         replication_factor=replication_factor,
     )
     storage_encryptor = StorageEncryptor.from_config(network.base_dir)
-    verifier = IntegrityVerifier(network)
+    verifier = IntegrityVerifier(network, storage_encryptor=storage_encryptor)
     mongodb_uri = mongodb_uri if mongodb_uri is not None else os.environ.get("DCAS_MONGODB_URI")
     mongodb_database = (
         mongodb_database
@@ -203,6 +203,7 @@ def create_app(
         except RuntimeError as error:
             return jsonify({"error": str(error)}), 503
 
+        manifest["storage_encrypted"] = True
         manifest["source_fingerprint"] = storage_encryptor.fingerprint(file_data)
         cid = manifest["cid"]["cid"]
         existing = metadata.get_file_info(cid)

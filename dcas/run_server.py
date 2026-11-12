@@ -6,6 +6,9 @@ Usage:
     python -m dcas.run_server --port 8080
     python -m dcas.run_server --nodes 6 --replication 3
 
+Use --migrate-shared-storage to encrypt existing shared files before serving.
+Stop the server and back up storage and metadata before running the migration.
+
 Set DCAS_MONGODB_URI to use MongoDB for metadata and audit logs.
 Otherwise, the server uses the SQLite database selected by --db.
 """
@@ -18,6 +21,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dcas.api.server import create_app
+from dcas.storage.migration import migrate_shared_storage
 
 
 def main():
@@ -28,6 +32,11 @@ def main():
     parser.add_argument("--replication", type=int, default=2, help="Replication factor")
     parser.add_argument("--network-dir", default="./dcas_api_network", help="Network storage directory")
     parser.add_argument("--db", default="dcas_api_metadata.db", help="Database file path")
+    parser.add_argument(
+        "--migrate-shared-storage",
+        action="store_true",
+        help="Encrypt existing shared files, then exit without starting the server",
+    )
     args = parser.parse_args()
 
     app = create_app(
@@ -36,6 +45,19 @@ def main():
         num_nodes=args.nodes,
         replication_factor=args.replication,
     )
+
+    if args.migrate_shared_storage:
+        components = app.extensions["dcas"]
+        try:
+            result = migrate_shared_storage(components)
+        finally:
+            components["metadata"].close()
+        print(
+            "Shared-storage migration complete: "
+            f"{result['migrated']} migrated, "
+            f"{result['already_encrypted']} already encrypted."
+        )
+        return
 
     display_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
     print("DCAS — Decentralized Content-Addressed Storage")

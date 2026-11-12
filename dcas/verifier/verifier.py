@@ -21,6 +21,7 @@ from ..core.hashing import HashEngine, HashAlgorithm
 from ..core.merkle import MerkleTree, MerkleProof
 from ..core.chunker import FileChunker
 from ..storage.network import StorageNetwork
+from ..storage.encryption import StorageEncryptor, StorageEncryptionError
 
 
 class VerificationStatus(Enum):
@@ -83,10 +84,12 @@ class IntegrityVerifier:
         self,
         network: StorageNetwork,
         algorithm: HashAlgorithm = HashAlgorithm.SHA256,
+        storage_encryptor: StorageEncryptor | None = None,
     ):
         self.network = network
         self.engine = HashEngine(algorithm)
         self.algorithm = algorithm
+        self.storage_encryptor = storage_encryptor
 
     # ── 1. Full file hash verification ──────────────────────────────
 
@@ -129,6 +132,24 @@ class IntegrityVerifier:
                 cid=cid_str,
                 elapsed_ms=elapsed,
             )
+
+        if manifest.get("cid_hash_is_client_content"):
+            if self.storage_encryptor is None:
+                return VerificationResult(
+                    status=VerificationStatus.ERROR,
+                    message="Cannot verify migrated shared content without the storage key.",
+                    cid=cid_str,
+                    elapsed_ms=(time.time() - start) * 1000,
+                )
+            try:
+                file_data = self.storage_encryptor.decrypt(file_data)
+            except StorageEncryptionError:
+                return VerificationResult(
+                    status=VerificationStatus.FAILED,
+                    message="Stored shared content failed its encryption authentication check.",
+                    cid=cid_str,
+                    elapsed_ms=(time.time() - start) * 1000,
+                )
 
         # Recompute hash
         actual_hash = self.engine.hash_bytes(file_data)

@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from dcas.api.server import create_app
+from dcas.storage.migration import migrate_shared_storage
 
 
 class TestWebApp(unittest.TestCase):
@@ -225,6 +228,95 @@ class TestWebApp(unittest.TestCase):
             headers=reader_headers,
         )
         self.assertEqual(verify.get_json()["status"], "PASSED")
+
+    def test_shared_storage_migration_preserves_access_and_cleans_legacy_chunks(self):
+        created = self.client.post("/api/spaces", json={"name": "Legacy space"})
+        space = created.get_json()
+        space_id = space["space_id"]
+        reader_headers = {"Authorization": f"Bearer {space['share_token']}"}
+        components = self.app.extensions["dcas"]
+        metadata = components["metadata"]
+        network = components["network"]
+        encryptor = components["storage_encryptor"]
+
+        client_key = b"c" * 32
+        nonce = b"n" * 12
+        client_payload = b"DCAS1" + nonce + AESGCM(client_key).encrypt(
+            nonce,
+            b"legacy shared file",
+            None,
+        )
+        legacy_manifest = network.store_bytes(client_payload, filename="legacy.bin")
+        legacy_cid = legacy_manifest["cid"]["cid"]
+        old_chunk_hashes = {
+            placement["chunk_hash"] for placement in legacy_manifest["placements"]
+        }
+        metadata.store_manifest(legacy_manifest, owner="shared", space_id=space_id)
+
+        previously_wrapped_payload = b"DCAS1old envelope"
+        wrapped_manifest = network.store_bytes(
+            encryptor.encrypt(previously_wrapped_payload),
+            filename="already-wrapped.bin",
+        )
+        wrapped_cid = wrapped_manifest["cid"]["cid"]
+        metadata.store_manifest(wrapped_manifest, owner="shared", space_id=space_id)
+
+        result = migrate_shared_storage(components)
+
+        self.assertEqual(result, {"migrated": 1, "already_encrypted": 1})
+        migrated_manifest = metadata.get_manifest(legacy_cid)
+        migrated_bytes = network.retrieve_file(migrated_manifest)
+        self.assertEqual(migrated_manifest["cid"]["cid"], legacy_cid)
+        self.assertTrue(migrated_manifest["cid_hash_is_client_content"])
+        self.assertTrue(migrated_manifest["storage_encrypted"])
+        self.assertEqual(encryptor.decrypt(migrated_bytes), client_payload)
+        self.assertTrue(metadata.has_shared_source_fingerprint(encryptor.fingerprint(client_payload)))
+        self.assertTrue(
+            all(
+                not node.has_chunk(chunk_hash)
+                for node in network.nodes
+                for chunk_hash in old_chunk_hashes
+            )
+        )
+        public_duplicate = self.client.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(client_payload), "public-copy.bin")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(public_duplicate.status_code, 409)
+
+        downloaded = self.client.get(
+            f"/api/spaces/{space_id}/files/{legacy_cid}/download",
+            headers=reader_headers,
+        )
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(downloaded.data, client_payload)
+        verification = self.client.post(
+            f"/api/spaces/{space_id}/files/{legacy_cid}/verify",
+            headers=reader_headers,
+        )
+        self.assertEqual(verification.get_json()["status"], "PASSED")
+
+        repeated = migrate_shared_storage(components)
+        self.assertEqual(repeated, {"migrated": 0, "already_encrypted": 2})
+        self.assertEqual(metadata.get_manifest(wrapped_cid)["cid"]["cid"], wrapped_cid)
+
+    def test_shared_storage_migration_stops_on_invalid_envelope(self):
+        created = self.client.post("/api/spaces", json={"name": "Damaged space"})
+        space_id = created.get_json()["space_id"]
+        components = self.app.extensions["dcas"]
+        encryptor = components["storage_encryptor"]
+        envelope = encryptor.encrypt(b"client payload")
+        damaged = envelope[:-1] + bytes([envelope[-1] ^ 1])
+        manifest = components["network"].store_bytes(damaged, filename="damaged.bin")
+        manifest["storage_encrypted"] = True
+        cid = manifest["cid"]["cid"]
+        components["metadata"].store_manifest(manifest, owner="shared", space_id=space_id)
+
+        with self.assertRaisesRegex(RuntimeError, "failed storage authentication"):
+            migrate_shared_storage(components)
+
+        self.assertEqual(components["metadata"].get_manifest(cid), manifest)
 
     def test_delete_file_removes_unshared_chunks_and_keeps_shared_chunks(self):
         shared_chunk = b"S" * (256 * 1024)

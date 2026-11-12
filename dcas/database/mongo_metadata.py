@@ -68,6 +68,33 @@ class MongoMetadataStore:
         document = self.files.find_one({"cid": cid}, {"manifest_json": 1})
         return document["manifest_json"] if document else None
 
+    def update_shared_manifest(self, cid: str, manifest: dict) -> bool:
+        """Update a shared manifest without changing its public CID."""
+        cid_info = manifest["cid"]
+        result = self.files.update_one(
+            {"cid": cid, "space_id": {"$ne": None}},
+            {"$set": {
+                "filename": manifest["filename"],
+                "hash_digest": cid_info["hash_digest"],
+                "algorithm": cid_info["algorithm"],
+                "total_size": manifest["total_size"],
+                "chunk_count": manifest["chunk_count"],
+                "merkle_root": manifest["merkle_root"],
+                "manifest_json": manifest,
+                "source_fingerprint": manifest.get("source_fingerprint"),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+        if result.matched_count == 0:
+            return False
+        self.log_event(
+            "STORAGE_ENCRYPTION_MIGRATION",
+            cid,
+            manifest["filename"],
+            "Shared file migrated to encrypted storage",
+        )
+        return True
+
     def get_file_info(self, cid: str) -> Optional[dict]:
         document = self.files.find_one({"cid": cid})
         if document is None:
