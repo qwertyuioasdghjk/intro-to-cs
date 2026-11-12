@@ -144,6 +144,21 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(encrypted_upload.status_code, 201)
         cid = encrypted_upload.get_json()["cid"]
 
+        components = self.app.extensions["dcas"]
+        manifest = components["metadata"].get_manifest(cid)
+        stored_envelope = components["network"].retrieve_file(manifest)
+        if stored_envelope is None:
+            self.fail("Shared upload was not retrievable from the network")
+        self.assertTrue(stored_envelope.startswith(b"DCAS-STORE-1:"))
+        self.assertEqual(components["storage_encryptor"].decrypt(stored_envelope), ciphertext)
+        chunk_hash = manifest["placements"][0]["chunk_hash"]
+        stored_nodes = [
+            node for node in components["network"].nodes if node.has_chunk(chunk_hash)
+        ]
+        self.assertTrue(stored_nodes)
+        for node in stored_nodes:
+            self.assertNotEqual(node.retrieve_chunk(chunk_hash), ciphertext)
+
         reader_list = self.client.get(f"/api/spaces/{space_id}/files", headers=reader_headers)
         self.assertEqual(reader_list.status_code, 200)
         self.assertEqual(reader_list.get_json()["count"], 1)

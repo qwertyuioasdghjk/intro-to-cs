@@ -47,6 +47,7 @@ class MetadataStore:
                 owner           TEXT DEFAULT 'system',
                 tags            TEXT DEFAULT '[]',
                 space_id        TEXT,
+                source_fingerprint TEXT,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             )
@@ -55,6 +56,8 @@ class MetadataStore:
         file_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(files)")}
         if "space_id" not in file_columns:
             cursor.execute("ALTER TABLE files ADD COLUMN space_id TEXT")
+        if "source_fingerprint" not in file_columns:
+            cursor.execute("ALTER TABLE files ADD COLUMN source_fingerprint TEXT")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS shared_spaces (
@@ -90,6 +93,10 @@ class MetadataStore:
         """)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_files_space ON files(space_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_files_source_fingerprint
+            ON files(source_fingerprint)
         """)
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_audit_cid ON audit_log(cid)
@@ -130,8 +137,8 @@ class MetadataStore:
             INSERT OR REPLACE INTO files
                 (cid, filename, hash_digest, algorithm, total_size,
                  chunk_count, merkle_root, manifest_json, owner, tags, space_id,
-                 created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_fingerprint, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cid_str,
@@ -145,6 +152,7 @@ class MetadataStore:
                 owner,
                 json.dumps(tags or []),
                 space_id,
+                manifest.get("source_fingerprint"),
                 now,
                 now,
             ),
@@ -197,6 +205,18 @@ class MetadataStore:
             params,
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    def has_shared_source_fingerprint(self, fingerprint: str) -> bool:
+        """Check whether matching content is already stored in a shared space."""
+        row = self.conn.execute(
+            """
+            SELECT 1 FROM files
+            WHERE space_id IS NOT NULL AND source_fingerprint = ?
+            LIMIT 1
+            """,
+            (fingerprint,),
+        ).fetchone()
+        return row is not None
 
     def create_shared_space(
         self,

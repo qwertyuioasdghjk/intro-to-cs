@@ -8,3 +8,4 @@ venv/
 !.env.example
 dcas_api_metadata.db*
 dcas_api_network/
+**/.dcas-storage-key

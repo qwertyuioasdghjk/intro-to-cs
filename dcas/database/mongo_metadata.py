@@ -24,6 +24,7 @@ class MongoMetadataStore:
         self.audit_log = self.db["audit_log"]
         self.files.create_index("cid", unique=True)
         self.files.create_index("space_id")
+        self.files.create_index("source_fingerprint")
         self.shared_spaces.create_index("space_id", unique=True)
         self.audit_log.create_index([("cid", 1)])
         self.audit_log.create_index([("event_type", 1)])
@@ -53,6 +54,7 @@ class MongoMetadataStore:
                 "owner": owner,
                 "tags": tags or [],
                 "space_id": space_id,
+                "source_fingerprint": manifest.get("source_fingerprint"),
                 "created_at": now,
                 "updated_at": now,
             },
@@ -98,6 +100,13 @@ class MongoMetadataStore:
         }
         documents = self.files.find(query, projection).sort("created_at", DESCENDING)
         return [self._with_string_id(document) for document in documents]
+
+    def has_shared_source_fingerprint(self, fingerprint: str) -> bool:
+        """Check whether matching content is already stored in a shared space."""
+        return self.files.find_one(
+            {"space_id": {"$ne": None}, "source_fingerprint": fingerprint},
+            {"_id": 1},
+        ) is not None
 
     def create_shared_space(
         self,

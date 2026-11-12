@@ -38,6 +38,7 @@ from ..storage.network import StorageNetwork
 from ..verifier.verifier import IntegrityVerifier
 from ..database.metadata import MetadataStore
 from ..database.mongo_metadata import MongoMetadataStore
+from ..storage.encryption import StorageEncryptor, StorageEncryptionError
 
 
 def create_app(
@@ -78,6 +79,7 @@ def create_app(
         num_nodes=num_nodes,
         replication_factor=replication_factor,
     )
+    storage_encryptor = StorageEncryptor.from_config(network.base_dir)
     verifier = IntegrityVerifier(network)
     mongodb_uri = mongodb_uri if mongodb_uri is not None else os.environ.get("DCAS_MONGODB_URI")
     mongodb_database = (
@@ -92,6 +94,7 @@ def create_app(
     )
     app.extensions["dcas"] = {
         "network": network,
+        "storage_encryptor": storage_encryptor,
         "verifier": verifier,
         "metadata": metadata,
     }
@@ -193,19 +196,21 @@ def create_app(
 
         file_data = file.read()
         if not file_data.startswith(b"DCAS1"):
-            return jsonify({"error": "Shared-space uploads must be encrypted in the browser first"}), 400
+            return jsonify({"error": "Shared-space uploads must use the DCAS1 client-side envelope"}), 400
         try:
-            manifest = network.store_bytes(file_data, filename=file.filename)
+            stored_data = storage_encryptor.encrypt(file_data)
+            manifest = network.store_bytes(stored_data, filename=file.filename)
         except RuntimeError as error:
             return jsonify({"error": str(error)}), 503
 
+        manifest["source_fingerprint"] = storage_encryptor.fingerprint(file_data)
         cid = manifest["cid"]["cid"]
         existing = metadata.get_file_info(cid)
         if existing:
             return jsonify({"error": "This content is already stored; choose a different file"}), 409
         metadata.store_manifest(manifest, owner="shared", space_id=space_id)
         return jsonify({
-            "message": "Encrypted file added to the shared space.",
+            "message": "File added to the shared space.",
             "cid": cid,
             "filename": manifest["filename"],
             "total_size": manifest["total_size"],
@@ -222,6 +227,10 @@ def create_app(
         file_data = network.retrieve_file(manifest)
         if file_data is None:
             return jsonify({"error": "Could not retrieve file from network"}), 500
+        try:
+            file_data = storage_encryptor.decrypt(file_data)
+        except StorageEncryptionError:
+            return jsonify({"error": "Stored file could not be decrypted; check the storage key and data integrity."}), 500
         metadata.log_event("RETRIEVE", cid, manifest["filename"], "Shared file downloaded")
         return send_file(
             io.BytesIO(file_data),
@@ -285,6 +294,9 @@ def create_app(
 
         # Read file data
         file_data = file.read()
+        source_fingerprint = storage_encryptor.fingerprint(file_data)
+        if metadata.has_shared_source_fingerprint(source_fingerprint):
+            return jsonify({"error": "This content belongs to a shared space and cannot be uploaded publicly"}), 409
 
         # Store in network
         try:
@@ -326,6 +338,10 @@ def create_app(
         owner = data.get("owner", "system")
         if not isinstance(filename, str) or not isinstance(owner, str):
             return jsonify({"error": "'filename' and 'owner' must be strings"}), 400
+
+        source_fingerprint = storage_encryptor.fingerprint(content)
+        if metadata.has_shared_source_fingerprint(source_fingerprint):
+            return jsonify({"error": "This content belongs to a shared space and cannot be uploaded publicly"}), 409
 
         try:
             manifest = network.store_bytes(content, filename=filename)
