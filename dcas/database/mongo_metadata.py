@@ -20,8 +20,11 @@ class MongoMetadataStore:
         self.client.admin.command("ping")
         self.db = self.client[database_name]
         self.files = self.db["files"]
+        self.shared_spaces = self.db["shared_spaces"]
         self.audit_log = self.db["audit_log"]
         self.files.create_index("cid", unique=True)
+        self.files.create_index("space_id")
+        self.shared_spaces.create_index("space_id", unique=True)
         self.audit_log.create_index([("cid", 1)])
         self.audit_log.create_index([("event_type", 1)])
         self.audit_log.create_index([("timestamp", DESCENDING)])
@@ -31,6 +34,7 @@ class MongoMetadataStore:
         manifest: dict,
         owner: str = "system",
         tags: list[str] | None = None,
+        space_id: str | None = None,
     ) -> str:
         now = datetime.now(timezone.utc).isoformat()
         cid_info = manifest["cid"]
@@ -48,6 +52,7 @@ class MongoMetadataStore:
                 "manifest_json": manifest,
                 "owner": owner,
                 "tags": tags or [],
+                "space_id": space_id,
                 "created_at": now,
                 "updated_at": now,
             },
@@ -68,8 +73,20 @@ class MongoMetadataStore:
         document["id"] = str(document.pop("_id"))
         return document
 
-    def list_files(self, owner: str | None = None) -> list[dict]:
-        query = {"owner": owner} if owner else {}
+    def list_files(
+        self,
+        owner: str | None = None,
+        space_id: str | None = None,
+        include_private: bool = False,
+    ) -> list[dict]:
+        if space_id is not None:
+            query = {"space_id": space_id}
+        elif include_private:
+            query = {}
+        else:
+            query = {"space_id": None}
+        if owner:
+            query["owner"] = owner
         projection = {
             "_id": 1,
             "cid": 1,
@@ -81,6 +98,40 @@ class MongoMetadataStore:
         }
         documents = self.files.find(query, projection).sort("created_at", DESCENDING)
         return [self._with_string_id(document) for document in documents]
+
+    def create_shared_space(
+        self,
+        space_id: str,
+        name: str,
+        admin_token_hash: str,
+        share_token_hash: str,
+    ) -> None:
+        self.shared_spaces.insert_one({
+            "space_id": space_id,
+            "name": name,
+            "admin_token_hash": admin_token_hash,
+            "share_token_hash": share_token_hash,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    def get_shared_space(self, space_id: str) -> Optional[dict]:
+        return self.shared_spaces.find_one({"space_id": space_id}, {"_id": 0})
+
+    def update_shared_space_link(self, space_id: str, share_token_hash: str | None) -> bool:
+        result = self.shared_spaces.update_one(
+            {"space_id": space_id},
+            {"$set": {"share_token_hash": share_token_hash}},
+        )
+        return result.matched_count > 0
+
+    def get_private_cids(self) -> set[str]:
+        return {
+            document["cid"]
+            for document in self.files.find(
+                {"space_id": {"$ne": None}},
+                {"_id": 0, "cid": 1},
+            )
+        }
 
     def delete_file(self, cid: str) -> bool:
         result = self.files.delete_one({"cid": cid})
@@ -100,7 +151,7 @@ class MongoMetadataStore:
             "created_at": 1,
         }
         documents = self.files.find(
-            {"$or": [{"filename": pattern}, {"cid": pattern}]},
+            {"space_id": None, "$or": [{"filename": pattern}, {"cid": pattern}]},
             projection,
         )
         return [self._with_string_id(document) for document in documents]

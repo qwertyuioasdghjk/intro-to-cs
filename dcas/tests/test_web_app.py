@@ -106,6 +106,78 @@ class TestWebApp(unittest.TestCase):
         status_after_recovery = self.client.get("/api/network/status").get_json()
         self.assertEqual(status_after_recovery["online_nodes"], 2)
 
+    def test_shared_space_is_encrypted_and_access_is_revocable(self):
+        self.assertEqual(self.client.get("/share/example").status_code, 200)
+        created = self.client.post("/api/spaces", json={"name": "Research group"})
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.headers["Cache-Control"], "no-store")
+        space = created.get_json()
+        space_id = space["space_id"]
+        admin_headers = {"Authorization": f"Bearer {space['admin_token']}"}
+        reader_headers = {"Authorization": f"Bearer {space['share_token']}"}
+
+        self.assertEqual(self.client.get(f"/api/spaces/{space_id}/files").status_code, 404)
+        reader_upload = self.client.post(
+            f"/api/spaces/{space_id}/files",
+            headers=reader_headers,
+            data={"file": (io.BytesIO(b"DCAS1encrypted"), "private.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(reader_upload.status_code, 404)
+
+        plain_upload = self.client.post(
+            f"/api/spaces/{space_id}/files",
+            headers=admin_headers,
+            data={"file": (io.BytesIO(b"not encrypted"), "private.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(plain_upload.status_code, 400)
+
+        ciphertext = b"DCAS1" + b"\x00" * 12 + b"encrypted"
+        encrypted_upload = self.client.post(
+            f"/api/spaces/{space_id}/files",
+            headers=admin_headers,
+            data={"file": (io.BytesIO(ciphertext), "private.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(encrypted_upload.status_code, 201)
+        cid = encrypted_upload.get_json()["cid"]
+
+        reader_list = self.client.get(f"/api/spaces/{space_id}/files", headers=reader_headers)
+        self.assertEqual(reader_list.status_code, 200)
+        self.assertEqual(reader_list.get_json()["count"], 1)
+        self.assertNotIn(cid, [item["cid"] for item in self.client.get("/api/files").get_json()["files"]])
+        self.assertEqual(self.client.get(f"/api/file/{cid}").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/download/{cid}").status_code, 404)
+        self.assertEqual(self.client.post(f"/api/verify/{cid}").status_code, 404)
+        self.assertEqual(self.client.get(f"/api/search?q=private").get_json()["count"], 0)
+        public_upload = self.client.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(ciphertext), "public-copy.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(public_upload.status_code, 409)
+        self.assertEqual(self.app.extensions["dcas"]["metadata"].get_file_info(cid)["space_id"], space_id)
+        self.assertEqual(
+            self.client.get(f"/api/audit-log?cid={cid}").get_json()["logs"],
+            [],
+        )
+        self.assertEqual(
+            self.client.get(f"/api/spaces/{space_id}/files/{cid}/download", headers=reader_headers).data,
+            ciphertext,
+        )
+
+        rotated = self.client.post(
+            f"/api/spaces/{space_id}/link/rotate",
+            headers=admin_headers,
+        ).get_json()
+        self.assertEqual(self.client.get(f"/api/spaces/{space_id}/files", headers=reader_headers).status_code, 404)
+        new_reader_headers = {"Authorization": f"Bearer {rotated['share_token']}"}
+        self.assertEqual(self.client.get(f"/api/spaces/{space_id}/files", headers=new_reader_headers).status_code, 200)
+
+        self.assertEqual(self.client.delete(f"/api/spaces/{space_id}/link", headers=admin_headers).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/spaces/{space_id}/files", headers=new_reader_headers).status_code, 404)
+
     def test_delete_file_removes_unshared_chunks_and_keeps_shared_chunks(self):
         shared_chunk = b"S" * (256 * 1024)
         first_upload = self.client.post(

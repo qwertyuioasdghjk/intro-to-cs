@@ -21,6 +21,7 @@
       <nav class="main-nav" aria-label="Main navigation">
         <a class="nav-link active" href="#overview"><span class="nav-icon">⌂</span>Overview</a>
         <a class="nav-link" href="#files"><span class="nav-icon">▤</span>Files</a>
+        <a class="nav-link" href="#spaces"><span class="nav-icon">◇</span>Shared spaces</a>
         <a class="nav-link" href="#network"><span class="nav-icon">◈</span>Network</a>
         <a class="nav-link" href="#activity"><span class="nav-icon">◷</span>Activity</a>
       </nav>
@@ -148,10 +149,49 @@
           <div class="activity-list" id="activity-list"><div class="empty-state">Loading audit history…</div></div>
         </section>
 
+        <section class="panel spaces-panel" id="spaces">
+          <div class="panel-heading">
+            <div><p class="eyebrow">PRIVATE BY CAPABILITY</p><h2>Shared spaces</h2></div>
+            <span class="activity-caption">Encrypted files · revocable read links</span>
+          </div>
+          <p class="spaces-notice">File contents are encrypted in your browser before they reach the storage network. Filenames, sizes, and access patterns remain visible to the storage service. Anyone with an active link can read and decrypt files; revoking it blocks future access but cannot take back downloaded or copied data.</p>
+          <div class="spaces-grid">
+            <form id="create-space-form" class="space-form">
+              <label class="field-label" for="space-name">Create a storage space
+                <input id="space-name" name="name" type="text" maxlength="120" required placeholder="e.g. Project research">
+              </label>
+              <button class="button button-primary" type="submit">＋ Create encrypted space</button>
+            </form>
+            <form id="space-upload-form" class="space-form">
+              <label class="field-label" for="space-select">Add an encrypted file
+                <select id="space-select" required aria-label="Choose a shared space">
+                  <option value="">Create a space first</option>
+                </select>
+              </label>
+              <label class="field-label" for="space-file">File
+                <input id="space-file" type="file" required>
+              </label>
+              <button class="button button-secondary" type="submit">Encrypt and upload</button>
+            </form>
+          </div>
+          <div id="spaces-list" class="spaces-list"><div class="empty-state">Your spaces will appear here. Space owner keys are kept in this browser.</div></div>
+          <p class="space-key-warning">Save your owner key and share link securely. This demo stores owner credentials in this browser and does not provide account recovery; it is not a substitute for production identity and key management.</p>
+        </section>
+
         <footer class="page-footer"><span><span class="footer-mark">D</span> DCAS <span class="footer-divider">·</span> Decentralized Content-Addressed Storage</span><span>Integrity, built into every byte.</span></footer>
       </div>
     </main>
   </div>
+
+  <main id="shared-view" class="shared-view hidden">
+    <header class="shared-header"><a class="brand shared-brand" href="/"><span class="brand-mark" aria-hidden="true">D</span><span><strong>DCAS</strong><small>Encrypted shared storage</small></span></a><span class="live-pill"><span class="status-dot"></span> Read-only access</span></header>
+    <section class="panel shared-panel">
+      <p class="eyebrow">DECENTRALIZED SHARED SPACE</p>
+      <h1 id="shared-title">Opening secure space…</h1>
+      <p class="welcome-copy">Files are encrypted in the owner's browser. This access link can read and decrypt them, but cannot add or remove files.</p>
+      <div id="shared-files" class="shared-files" role="status" aria-live="polite"><div class="empty-state">Checking your access link…</div></div>
+    </section>
+  </main>
 
   <dialog class="detail-dialog" id="file-dialog" aria-labelledby="dialog-title">
     <div class="dialog-header">

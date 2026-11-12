@@ -1,7 +1,7 @@
 """
 SQLite-backed metadata store and audit log.
 
-Stores file manifests, CID mappings, ownership info,
+Stores file manifests, shared-space credentials, ownership info,
 and a full audit trail of every verification event.
 """
 
@@ -18,6 +18,7 @@ class MetadataStore:
 
     Tables:
         files      – File manifests, CIDs, and ownership.
+        shared_spaces – Shared-space metadata and hashed access tokens.
         audit_log  – Timestamped records of uploads, retrievals,
                      verifications, and errors.
     """
@@ -45,8 +46,23 @@ class MetadataStore:
                 manifest_json   TEXT NOT NULL,
                 owner           TEXT DEFAULT 'system',
                 tags            TEXT DEFAULT '[]',
+                space_id        TEXT,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
+            )
+        """)
+
+        file_columns = {row["name"] for row in cursor.execute("PRAGMA table_info(files)")}
+        if "space_id" not in file_columns:
+            cursor.execute("ALTER TABLE files ADD COLUMN space_id TEXT")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS shared_spaces (
+                space_id            TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                admin_token_hash    TEXT NOT NULL,
+                share_token_hash    TEXT,
+                created_at          TEXT NOT NULL
             )
         """)
 
@@ -67,6 +83,9 @@ class MetadataStore:
             CREATE INDEX IF NOT EXISTS idx_files_cid ON files(cid)
         """)
         cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_files_space ON files(space_id)
+        """)
+        cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_audit_cid ON audit_log(cid)
         """)
         cursor.execute("""
@@ -77,7 +96,13 @@ class MetadataStore:
 
     # ── File manifest operations ────────────────────────────────────
 
-    def store_manifest(self, manifest: dict, owner: str = "system", tags: list[str] | None = None) -> int:
+    def store_manifest(
+        self,
+        manifest: dict,
+        owner: str = "system",
+        tags: list[str] | None = None,
+        space_id: str | None = None,
+    ) -> int:
         """
         Store a file manifest in the database.
 
@@ -98,9 +123,9 @@ class MetadataStore:
             """
             INSERT OR REPLACE INTO files
                 (cid, filename, hash_digest, algorithm, total_size,
-                 chunk_count, merkle_root, manifest_json, owner, tags,
+                 chunk_count, merkle_root, manifest_json, owner, tags, space_id,
                  created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cid_str,
@@ -113,6 +138,7 @@ class MetadataStore:
                 json.dumps(manifest),
                 owner,
                 json.dumps(tags or []),
+                space_id,
                 now,
                 now,
             ),
@@ -140,19 +166,70 @@ class MetadataStore:
             return dict(row)
         return None
 
-    def list_files(self, owner: str | None = None) -> list[dict]:
-        """List all stored files, optionally filtered by owner."""
+    def list_files(
+        self,
+        owner: str | None = None,
+        space_id: str | None = None,
+        include_private: bool = False,
+    ) -> list[dict]:
+        """List files, excluding shared-space files unless a space is selected."""
         cursor = self.conn.cursor()
+        conditions = []
+        params = []
+        if space_id is not None:
+            conditions.append("space_id = ?")
+            params.append(space_id)
+        elif not include_private:
+            conditions.append("space_id IS NULL")
         if owner:
-            cursor.execute(
-                "SELECT id, cid, filename, total_size, chunk_count, owner, created_at FROM files WHERE owner = ? ORDER BY created_at DESC",
-                (owner,),
-            )
-        else:
-            cursor.execute(
-                "SELECT id, cid, filename, total_size, chunk_count, owner, created_at FROM files ORDER BY created_at DESC"
-            )
+            conditions.append("owner = ?")
+            params.append(owner)
+        where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        cursor.execute(
+            "SELECT id, cid, filename, total_size, chunk_count, owner, created_at "
+            f"FROM files{where_clause} ORDER BY created_at DESC",
+            params,
+        )
         return [dict(row) for row in cursor.fetchall()]
+
+    def create_shared_space(
+        self,
+        space_id: str,
+        name: str,
+        admin_token_hash: str,
+        share_token_hash: str,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO shared_spaces
+                (space_id, name, admin_token_hash, share_token_hash, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (space_id, name, admin_token_hash, share_token_hash, now),
+        )
+        self.conn.commit()
+
+    def get_shared_space(self, space_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM shared_spaces WHERE space_id = ?",
+            (space_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_shared_space_link(self, space_id: str, share_token_hash: str | None) -> bool:
+        cursor = self.conn.execute(
+            "UPDATE shared_spaces SET share_token_hash = ? WHERE space_id = ?",
+            (share_token_hash, space_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_private_cids(self) -> set[str]:
+        rows = self.conn.execute(
+            "SELECT cid FROM files WHERE space_id IS NOT NULL"
+        ).fetchall()
+        return {row["cid"] for row in rows}
 
     def delete_file(self, cid: str) -> bool:
         """Delete a file's metadata by CID."""
@@ -168,7 +245,8 @@ class MetadataStore:
         """Search files by filename or CID (partial match)."""
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, cid, filename, total_size, owner, created_at FROM files WHERE filename LIKE ? OR cid LIKE ?",
+            "SELECT id, cid, filename, total_size, owner, created_at FROM files "
+            "WHERE space_id IS NULL AND (filename LIKE ? OR cid LIKE ?)",
             (f"%{query}%", f"%{query}%"),
         )
         return [dict(row) for row in cursor.fetchall()]

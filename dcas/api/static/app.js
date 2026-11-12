@@ -328,6 +328,304 @@ async function deleteFile(file) {
   }
 }
 
+const SPACE_STORAGE_KEY = "dcas.shared-spaces";
+const spacesList = $("#spaces-list");
+const spaceSelect = $("#space-select");
+
+function readOwnedSpaces() {
+  try {
+    const spaces = JSON.parse(window.localStorage.getItem(SPACE_STORAGE_KEY) || "[]");
+    return Array.isArray(spaces) ? spaces : [];
+  } catch (error) {
+    showToast(`Could not read spaces stored in this browser: ${error.message}`, true);
+    return [];
+  }
+}
+
+function saveOwnedSpaces(spaces) {
+  window.localStorage.setItem(SPACE_STORAGE_KEY, JSON.stringify(spaces));
+}
+
+function bytesToBase64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function base64UrlToBytes(value) {
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
+  const binary = atob(base64 + "=".repeat((4 - base64.length % 4) % 4));
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function sharedAccessUrl(space) {
+  const url = new URL(`/share/${encodeURIComponent(space.space_id)}`, window.location.origin);
+  url.hash = new URLSearchParams({ access: space.share_token, key: space.key }).toString();
+  return url.toString();
+}
+
+function renderSpaceSelector(spaces) {
+  spaceSelect.replaceChildren();
+  const placeholder = node("option", "", spaces.length ? "Choose a shared space" : "Create a space first");
+  placeholder.value = "";
+  spaceSelect.append(placeholder);
+  for (const space of spaces) {
+    const option = node("option", "", space.name);
+    option.value = space.space_id;
+    spaceSelect.append(option);
+  }
+  spaceSelect.disabled = spaces.length === 0;
+}
+
+function renderOwnedSpaces() {
+  const spaces = readOwnedSpaces();
+  renderSpaceSelector(spaces);
+  spacesList.replaceChildren();
+  if (!spaces.length) {
+    spacesList.append(node("div", "empty-state", "Your spaces will appear here. Space owner keys are kept in this browser."));
+    return;
+  }
+
+  for (const space of spaces) {
+    const card = node("article", "space-card");
+    const info = node("div", "space-card-info");
+    const status = node("span", "", "Checking space…");
+    info.append(node("strong", "", space.name), status);
+
+    const actions = node("div", "space-card-actions");
+    const copyButton = node("button", "button button-secondary", "Copy access link");
+    copyButton.type = "button";
+    copyButton.disabled = !space.share_token;
+    copyButton.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(sharedAccessUrl(space));
+        showToast("Read-only access link copied. Anyone with it can read and decrypt this space.");
+      } catch (error) {
+        showToast(`Could not copy the access link: ${error.message}`, true);
+      }
+    });
+
+    const rotateButton = node("button", "button button-secondary", space.share_token ? "Replace link" : "Create link");
+    rotateButton.type = "button";
+    rotateButton.addEventListener("click", () => rotateSpaceLink(space.space_id));
+    const revokeButton = node("button", "button button-secondary", "Revoke");
+    revokeButton.type = "button";
+    revokeButton.disabled = !space.share_token;
+    revokeButton.addEventListener("click", () => revokeSpaceLink(space.space_id));
+    actions.append(copyButton, rotateButton, revokeButton);
+    card.append(info, actions);
+    spacesList.append(card);
+
+    api(`/api/spaces/${encodeURIComponent(space.space_id)}/files`, {
+      headers: { Authorization: `Bearer ${space.admin_token}` }
+    }).then((result) => {
+      status.textContent = `${result.count} ${result.count === 1 ? "file" : "files"} · ${space.share_token ? "access link active" : "link revoked"}`;
+    }).catch((error) => {
+      status.textContent = `Could not load space: ${error.message}`;
+    });
+  }
+}
+
+async function rotateSpaceLink(spaceId) {
+  const spaces = readOwnedSpaces();
+  const space = spaces.find((item) => item.space_id === spaceId);
+  if (!space) return;
+  try {
+    const result = await api(`/api/spaces/${encodeURIComponent(spaceId)}/link/rotate`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${space.admin_token}` }
+    });
+    space.share_token = result.share_token;
+    saveOwnedSpaces(spaces);
+    renderOwnedSpaces();
+    showToast("New access link created. Any previous link is now invalid.");
+  } catch (error) {
+    showToast(`Could not create an access link: ${error.message}`, true);
+  }
+}
+
+async function revokeSpaceLink(spaceId) {
+  const spaces = readOwnedSpaces();
+  const space = spaces.find((item) => item.space_id === spaceId);
+  if (!space || !window.confirm("Revoke this link? People using it will lose future access.")) return;
+  try {
+    const result = await api(`/api/spaces/${encodeURIComponent(spaceId)}/link`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${space.admin_token}` }
+    });
+    space.share_token = "";
+    saveOwnedSpaces(spaces);
+    renderOwnedSpaces();
+    showToast(result.message);
+  } catch (error) {
+    showToast(`Could not revoke the access link: ${error.message}`, true);
+  }
+}
+
+async function createSharedSpace(event) {
+  event.preventDefault();
+  const nameInput = $("#space-name");
+  if (!window.crypto?.subtle) {
+    showToast("Browser encryption requires HTTPS or localhost and Web Crypto support.", true);
+    return;
+  }
+  const button = event.submitter;
+  setLoading(button, true, "Creating…");
+  try {
+    const result = await api("/api/spaces", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: nameInput.value.trim() })
+    });
+    const key = window.crypto.getRandomValues(new Uint8Array(32));
+    const spaces = readOwnedSpaces();
+    spaces.push({
+      space_id: result.space_id,
+      name: result.name,
+      admin_token: result.admin_token,
+      share_token: result.share_token,
+      key: bytesToBase64Url(key)
+    });
+    saveOwnedSpaces(spaces);
+    event.target.reset();
+    renderOwnedSpaces();
+    showToast("Encrypted space created. Copy its access link to invite readers.");
+  } catch (error) {
+    showToast(`Could not create the space: ${error.message}`, true);
+  } finally {
+    setLoading(button, false, "＋ Create encrypted space");
+  }
+}
+
+async function uploadToSharedSpace(event) {
+  event.preventDefault();
+  const file = $("#space-file").files[0];
+  const space = readOwnedSpaces().find((item) => item.space_id === spaceSelect.value);
+  if (!file || !space) {
+    showToast("Choose a shared space and a file first.", true);
+    return;
+  }
+  if (!window.crypto?.subtle) {
+    showToast("Browser encryption requires HTTPS or localhost and Web Crypto support.", true);
+    return;
+  }
+
+  const button = event.submitter;
+  setLoading(button, true, "Encrypting and uploading…");
+  try {
+    const keyBytes = base64UrlToBytes(space.key);
+    const cryptoKey = await window.crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const encrypted = new Uint8Array(await window.crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      cryptoKey,
+      await file.arrayBuffer()
+    ));
+    const payload = new Blob([new TextEncoder().encode("DCAS1"), iv, encrypted], { type: "application/octet-stream" });
+    const encryptedFile = new File([payload], file.name, { type: "application/octet-stream" });
+    const formData = new FormData();
+    formData.append("file", encryptedFile, file.name);
+    const result = await api(`/api/spaces/${encodeURIComponent(space.space_id)}/files`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${space.admin_token}` },
+      body: formData
+    });
+    event.target.reset();
+    showToast(`${result.filename} encrypted and added to ${space.name}.`);
+    renderOwnedSpaces();
+  } catch (error) {
+    showToast(`Could not encrypt or upload the file: ${error.message}`, true);
+  } finally {
+    setLoading(button, false, "Encrypt and upload");
+  }
+}
+
+async function openSharedSpace() {
+  $(".app-shell").classList.add("hidden");
+  $("#shared-view").classList.remove("hidden");
+  const access = new URLSearchParams(window.location.hash.slice(1));
+  const token = access.get("access");
+  const key = access.get("key");
+  window.history.replaceState(null, "", window.location.pathname);
+  const sharedFiles = $("#shared-files");
+  if (!token || !key) {
+    $("#shared-title").textContent = "Access link is incomplete";
+    sharedFiles.replaceChildren(node("div", "empty-state", "Ask the space owner for a new access link."));
+    return;
+  }
+
+  const spaceId = decodeURIComponent(window.location.pathname.split("/").pop());
+  try {
+    const result = await api(`/api/spaces/${encodeURIComponent(spaceId)}/files`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    $("#shared-title").textContent = result.name;
+    sharedFiles.replaceChildren();
+    if (!result.files.length) {
+      sharedFiles.append(node("div", "empty-state", "This space does not contain any files yet."));
+      return;
+    }
+
+    for (const file of result.files) {
+      const row = node("article", "shared-file-row");
+      const info = node("div");
+      info.append(
+        node("div", "shared-file-name", file.filename),
+        node("div", "shared-file-meta", `${formatBytes(file.total_size)} · Encrypted on the storage network`)
+      );
+      const download = node("button", "button button-secondary", "Decrypt and download");
+      download.type = "button";
+      download.addEventListener("click", () => downloadSharedFile(spaceId, file, token, key, download));
+      row.append(info, download);
+      sharedFiles.append(row);
+    }
+  } catch (error) {
+    $("#shared-title").textContent = "Could not open this space";
+    sharedFiles.replaceChildren(node("div", "empty-state", `Access failed: ${error.message}. Ask the owner for a current link.`));
+  }
+}
+
+async function downloadSharedFile(spaceId, file, token, encodedKey, button) {
+  setLoading(button, true, "Decrypting…");
+  try {
+    const response = await fetch(
+      `/api/spaces/${encodeURIComponent(spaceId)}/files/${encodeURIComponent(file.cid)}/download`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new Error(payload?.error || `Request failed (${response.status})`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const header = new TextDecoder().decode(bytes.slice(0, 5));
+    if (header !== "DCAS1" || bytes.length < 18) {
+      throw new Error("The encrypted file format is invalid.");
+    }
+    const cryptoKey = await window.crypto.subtle.importKey(
+      "raw",
+      base64UrlToBytes(encodedKey),
+      "AES-GCM",
+      false,
+      ["decrypt"]
+    );
+    const plain = await window.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: bytes.slice(5, 17) },
+      cryptoKey,
+      bytes.slice(17)
+    );
+    const url = URL.createObjectURL(new Blob([plain]));
+    const anchor = node("a");
+    anchor.href = url;
+    anchor.download = file.filename;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    showToast(`Could not decrypt ${file.filename}: ${error.message}`, true);
+  } finally {
+    setLoading(button, false, "Decrypt and download");
+  }
+}
+
 $("#file-input").addEventListener("change", (event) => {
   const [file] = event.target.files;
   if (file) updateSelectedFile(file);
@@ -436,5 +734,13 @@ document.querySelectorAll(".nav-link").forEach((link) => {
   });
 });
 
-loadDashboard();
-window.setInterval(loadDashboard, 30000);
+$("#create-space-form").addEventListener("submit", createSharedSpace);
+$("#space-upload-form").addEventListener("submit", uploadToSharedSpace);
+
+if (window.location.pathname.startsWith("/share/")) {
+  openSharedSpace();
+} else {
+  renderOwnedSpaces();
+  loadDashboard();
+  window.setInterval(loadDashboard, 30000);
+}
