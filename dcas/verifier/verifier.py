@@ -5,23 +5,30 @@ Provides multiple verification modes:
 1. Full hash verification   — recompute the hash of retrieved data.
 2. Chunk-level verification — verify each chunk individually.
 3. Merkle proof verification — verify a single chunk belongs to a dataset.
-4. Storage proof (challenge) — challenge a node to prove it holds specific data.
-5. Network-wide audit       — verify all chunks across all nodes.
+4. Retrievability check — request a chunk from a node and verify its committed hash.
+5. Sampled Merkle challenge — verify selected chunks against the committed root.
+6. RSA-PDP challenge — verify possession of random sectors without downloading them.
+7. Network-wide audit — verify all chunks across all nodes.
 """
 
 import os
 import json
-import random
+import base64
+import secrets
+import binascii
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
+from urllib.error import URLError
 
 from ..core.hashing import HashEngine, HashAlgorithm
 from ..core.merkle import MerkleTree, MerkleProof
 from ..core.chunker import FileChunker
 from ..storage.network import StorageNetwork
 from ..storage.encryption import StorageEncryptor, StorageEncryptionError
+from ..storage.pdp import StoragePDP
 
 
 class VerificationStatus(Enum):
@@ -79,6 +86,8 @@ class IntegrityVerifier:
         >>> result = verifier.verify_file_integrity(manifest)
         >>> print(result.status, result.message)
     """
+
+    DEFAULT_PDP_SAMPLE_COUNT = 32
 
     def __init__(
         self,
@@ -354,33 +363,38 @@ class IntegrityVerifier:
                 elapsed_ms=elapsed,
             )
 
-    # ── 4. Storage proof (challenge-response) ───────────────────────
+    # ── 4. Node retrievability ──────────────────────────────────────
 
-    def challenge_node(
+    def check_node_retrievability(
         self,
         node_id: str,
-        chunk_hash: str,
-        challenge_bytes: bytes | None = None,
+        manifest: dict,
+        sample_count: int = 1,
     ) -> VerificationResult:
         """
-        Challenge a specific node to prove it holds a chunk.
+        Sample chunks assigned to one node and verify their committed hashes.
 
-        The verifier sends a random challenge; the node must respond
-        with H(chunk_data || challenge). The verifier independently
-        computes the expected response.
-
-        This simulates a simplified Proof of Data Possession (PDP).
+        Sampled chunks are downloaded in full from the node's HTTP service when
+        configured, or directly from the local node in simulation mode. This is
+        a probabilistic availability check, not a cryptographic proof of
+        possession or long-term storage.
 
         Args:
-            node_id:         The node to challenge.
-            chunk_hash:      The hash of the chunk to verify.
-            challenge_bytes: Optional challenge nonce (random if None).
+            node_id:     The node to check.
+            manifest:    The manifest whose placements define chunks for this node.
+            sample_count: Number of random chunks to retrieve and verify.
 
         Returns:
             A VerificationResult.
         """
         import time
         start = time.time()
+        if (
+            not isinstance(sample_count, int)
+            or isinstance(sample_count, bool)
+            or sample_count < 1
+        ):
+            raise ValueError("Sample count must be a positive integer.")
 
         node = self.network._get_node(node_id)
         if node is None:
@@ -391,66 +405,454 @@ class IntegrityVerifier:
                 elapsed_ms=elapsed,
             )
 
-        if not node.is_online:
+        if node_id not in self.network.node_urls and not node.is_online:
             elapsed = (time.time() - start) * 1000
             return VerificationResult(
                 status=VerificationStatus.WARNING,
-                message=f"Node {node_id} is offline; cannot complete challenge.",
+                message=f"Node {node_id} is offline; retrievability cannot be checked.",
                 elapsed_ms=elapsed,
             )
 
-        # Generate challenge nonce
-        if challenge_bytes is None:
-            challenge_bytes = random.randbytes(32)
+        eligible = [
+            placement for placement in manifest["placements"]
+            if node_id in placement["stored_on"]
+        ]
+        if not eligible:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=f"Manifest has no chunks assigned to node {node_id}.",
+                cid=manifest["cid"]["cid"],
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+        if sample_count > len(eligible):
+            raise ValueError(
+                f"Sample count {sample_count} exceeds the {len(eligible)} chunks "
+                f"assigned to node {node_id}."
+            )
 
-        # Retrieve chunk from the node
-        chunk_data = node.retrieve_chunk(chunk_hash)
+        samples = secrets.SystemRandom().sample(eligible, sample_count)
+        chunk_results = []
+        all_passed = True
+        for placement in samples:
+            chunk_hash = placement["chunk_hash"]
+            try:
+                chunk_data = self.network.retrieve_chunk_from_node(
+                    node_id,
+                    chunk_hash,
+                    expected_size=placement["chunk_size"],
+                )
+            except (URLError, TimeoutError, OSError) as error:
+                return VerificationResult(
+                    status=VerificationStatus.WARNING,
+                    message=f"Could not reach node {node_id} retrieval service: {error}",
+                    details={
+                        "node_id": node_id,
+                        "samples_checked": chunk_results,
+                    },
+                    cid=manifest["cid"]["cid"],
+                    elapsed_ms=(time.time() - start) * 1000,
+                )
+
+            actual_hash = self.engine.hash_bytes(chunk_data) if chunk_data is not None else None
+            passed = actual_hash == chunk_hash
+            all_passed = all_passed and passed
+            chunk_results.append({
+                "chunk_index": placement["chunk_index"],
+                "chunk_hash": chunk_hash,
+                "actual_hash": actual_hash,
+                "bytes_returned": len(chunk_data) if chunk_data is not None else 0,
+                "status": "PASSED" if passed else "FAILED",
+            })
 
         elapsed = (time.time() - start) * 1000
-
-        if chunk_data is None:
-            return VerificationResult(
-                status=VerificationStatus.FAILED,
-                message=f"Node {node_id} does not hold chunk {chunk_hash[:16]}...",
-                details={
-                    "node_id": node_id,
-                    "chunk_hash": chunk_hash,
-                },
-                elapsed_ms=elapsed,
-            )
-
-        # Compute expected response: H(chunk_data || challenge)
-        expected_response = self.engine.hash_bytes(chunk_data + challenge_bytes)
-
-        # Simulate node computing its response
-        node_response = self.engine.hash_bytes(chunk_data + challenge_bytes)
-
-        if node_response == expected_response:
+        if all_passed:
             return VerificationResult(
                 status=VerificationStatus.PASSED,
-                message=f"Storage proof PASSED: Node {node_id} proved possession of chunk {chunk_hash[:16]}...",
+                message=(
+                    f"Sampled retrievability check PASSED: Node {node_id} returned "
+                    f"{sample_count} chunk(s) matching their committed hashes."
+                ),
                 details={
                     "node_id": node_id,
-                    "chunk_hash": chunk_hash,
-                    "challenge_size": len(challenge_bytes),
-                    "response_hash": node_response,
+                    "sample_count": sample_count,
+                    "samples_checked": chunk_results,
                 },
+                cid=manifest["cid"]["cid"],
                 elapsed_ms=elapsed,
             )
         else:
             return VerificationResult(
                 status=VerificationStatus.FAILED,
-                message=f"Storage proof FAILED: Node {node_id} response mismatch.",
+                message=(
+                    f"Sampled retrievability check FAILED: Node {node_id} could not "
+                    "return one or more sampled chunks matching their committed hashes."
+                ),
                 details={
                     "node_id": node_id,
-                    "chunk_hash": chunk_hash,
-                    "expected": expected_response,
-                    "received": node_response,
+                    "sample_count": sample_count,
+                    "samples_checked": chunk_results,
                 },
+                cid=manifest["cid"]["cid"],
                 elapsed_ms=elapsed,
             )
 
-    # ── 5. Network-wide audit ───────────────────────────────────────
+    # ── 5. Sampled Merkle challenge ─────────────────────────────────
+
+    def challenge_node(
+        self,
+        node_id: str,
+        manifest: dict,
+        sample_count: int = 1,
+    ) -> VerificationResult:
+        """
+        Ask a node for random chunks and their Merkle paths, then verify them.
+
+        This is a sampled retrievability challenge, not a formal PDP/PoR proof.
+        """
+        import time
+        start = time.time()
+
+        if (
+            not isinstance(sample_count, int)
+            or isinstance(sample_count, bool)
+            or not 1 <= sample_count <= 64
+        ):
+            raise ValueError("Sample count must be an integer from 1 to 64.")
+
+        node = self.network._get_node(node_id)
+        if node is None:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=f"Node {node_id} not found in the network.",
+                cid=manifest.get("cid", {}).get("cid"),
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+
+        if node_id not in self.network.node_urls and not node.is_online:
+            return VerificationResult(
+                status=VerificationStatus.WARNING,
+                message=f"Node {node_id} is offline; cannot complete the challenge.",
+                cid=manifest.get("cid", {}).get("cid"),
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+
+        eligible = [
+            placement for placement in manifest.get("placements", [])
+            if node_id in placement.get("stored_on", [])
+        ]
+        if not eligible:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=f"Manifest has no chunks assigned to node {node_id}.",
+                cid=manifest.get("cid", {}).get("cid"),
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+        if sample_count > len(eligible):
+            raise ValueError(
+                f"Sample count {sample_count} exceeds the {len(eligible)} chunks "
+                f"assigned to node {node_id}."
+            )
+
+        nonce = secrets.token_bytes(32)
+        root_hash = manifest.get("merkle_root")
+        challenges = [
+            {
+                "chunk_hash": placement["chunk_hash"],
+                "chunk_index": placement["chunk_index"],
+                "merkle_root": root_hash,
+            }
+            for placement in secrets.SystemRandom().sample(eligible, sample_count)
+        ]
+
+        try:
+            response = self.network.challenge_chunks(node_id, nonce, challenges)
+        except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as error:
+            return VerificationResult(
+                status=VerificationStatus.WARNING,
+                message=f"Could not complete the challenge with node {node_id}: {error}",
+                details={
+                    "node_id": node_id,
+                    "sample_count": sample_count,
+                },
+                cid=manifest.get("cid", {}).get("cid"),
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+
+        sample_results = []
+        valid = (
+            isinstance(response, dict)
+            and response.get("nonce_hex") == nonce.hex()
+            and isinstance(response.get("chunks"), list)
+            and len(response["chunks"]) == len(challenges)
+        )
+
+        if valid:
+            for challenge, returned in zip(challenges, response["chunks"]):
+                result = {
+                    "chunk_index": challenge["chunk_index"],
+                    "chunk_hash": challenge["chunk_hash"],
+                    "status": "FAILED",
+                }
+                proof_depth = 0
+                if (
+                    not isinstance(returned, dict)
+                    or returned.get("chunk_hash") != challenge["chunk_hash"]
+                    or not isinstance(returned.get("chunk_index"), int)
+                    or isinstance(returned.get("chunk_index"), bool)
+                    or returned.get("chunk_index") != challenge["chunk_index"]
+                    or not isinstance(returned.get("data_base64"), str)
+                ):
+                    sample_results.append(result)
+                    valid = False
+                    continue
+
+                try:
+                    chunk_data = base64.b64decode(returned["data_base64"], validate=True)
+                    proof_data = returned["proof"]
+                    proof = MerkleProof.from_dict(proof_data)
+                    proof_depth = len(proof.proof_hashes)
+                    hash_matches = (
+                        len(chunk_data) == next(
+                            placement["chunk_size"]
+                            for placement in eligible
+                            if placement["chunk_index"] == challenge["chunk_index"]
+                        )
+                        and self.engine.hash_bytes(chunk_data) == challenge["chunk_hash"]
+                    )
+                    proof_valid = (
+                        proof.leaf_index == challenge["chunk_index"]
+                        and proof.leaf_hash == challenge["chunk_hash"]
+                        and proof.root_hash == root_hash
+                        and MerkleTree.verify_proof(proof, self.algorithm)
+                    )
+                except (KeyError, StopIteration, TypeError, ValueError, binascii.Error):
+                    hash_matches = False
+                    proof_valid = False
+
+                result["proof_depth"] = proof_depth
+                result["status"] = "PASSED" if hash_matches and proof_valid else "FAILED"
+                sample_results.append(result)
+                valid = valid and hash_matches and proof_valid
+        else:
+            valid = False
+
+        elapsed = (time.time() - start) * 1000
+        status = VerificationStatus.PASSED if valid else VerificationStatus.FAILED
+        return VerificationResult(
+            status=status,
+            message=(
+                f"Sampled Merkle challenge {'PASSED' if valid else 'FAILED'}: "
+                f"Node {node_id} returned {len(sample_results)}/{sample_count} "
+                "chunks with valid inclusion proofs."
+            ),
+            details={
+                "node_id": node_id,
+                "sample_count": sample_count,
+                "nonce_hex": nonce.hex(),
+                "merkle_root": root_hash,
+                "samples_checked": sample_results,
+            },
+            cid=manifest.get("cid", {}).get("cid"),
+            elapsed_ms=elapsed,
+        )
+
+    # ── 6. RSA proof-of-data-possession ──────────────────────────────
+
+    def prove_node_possession(
+        self,
+        node_id: str,
+        manifest: dict,
+        sample_count: int | None = None,
+    ) -> VerificationResult:
+        """Verify an RSA-PDP aggregate proof without downloading challenged sectors."""
+        import time
+        start = time.time()
+        cid_str = manifest.get("cid", {}).get("cid")
+        pdp_metadata = manifest.get("pdp")
+
+        if not isinstance(pdp_metadata, dict) or pdp_metadata.get("scheme") != StoragePDP.SCHEME:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message="This file has no RSA-PDP tags; upload it again to enable PDP challenges.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+        if (
+            sample_count is not None
+            and (
+                not isinstance(sample_count, int)
+                or isinstance(sample_count, bool)
+                or not 1 <= sample_count <= 64
+            )
+        ):
+            raise ValueError("Sample count must be an integer from 1 to 64.")
+
+        node = self.network._get_node(node_id)
+        if node is None:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=f"Node {node_id} not found in the network.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+        if node_id not in self.network.node_urls and not node.is_online:
+            return VerificationResult(
+                status=VerificationStatus.WARNING,
+                message=f"Node {node_id} is offline; cannot complete the PDP challenge.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+
+        file_id = cid_str
+        total_size = manifest.get("total_size")
+        sector_size = pdp_metadata.get("sector_size")
+        chunk_size = pdp_metadata.get("storage_chunk_size")
+        sector_count = pdp_metadata.get("sector_count")
+        if (
+            not isinstance(file_id, str)
+            or not file_id
+            or pdp_metadata.get("file_id") != file_id
+            or not isinstance(total_size, int)
+            or isinstance(total_size, bool)
+            or total_size < 0
+            or sector_size != StoragePDP.SECTOR_SIZE
+            or not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size <= 0
+            or chunk_size % sector_size
+            or sector_count != StoragePDP.block_count(total_size)
+            or not isinstance(pdp_metadata.get("n"), str)
+            or not re.fullmatch(r"[0-9a-f]{512,1024}", pdp_metadata["n"])
+            or not isinstance(pdp_metadata.get("e"), str)
+            or not re.fullmatch(r"[0-9a-f]{1,8}", pdp_metadata["e"])
+            or not isinstance(pdp_metadata.get("u"), str)
+            or not re.fullmatch(r"[0-9a-f]{1,1024}", pdp_metadata["u"])
+        ):
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message="Manifest contains invalid RSA-PDP parameters.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+
+        placements = {
+            placement["chunk_index"]: placement
+            for placement in manifest.get("placements", [])
+        }
+        eligible = []
+        for index in range(sector_count):
+            data_offset = index * sector_size
+            chunk_index = data_offset // chunk_size
+            placement = placements.get(chunk_index)
+            if placement is None or node_id not in placement.get("stored_on", []):
+                continue
+            eligible.append({
+                "sector_index": index,
+                "chunk_hash": placement["chunk_hash"],
+                "chunk_offset": data_offset - chunk_index * chunk_size,
+                "length": min(sector_size, max(0, total_size - data_offset)),
+            })
+
+        if not eligible:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=f"Manifest has no PDP sectors assigned to node {node_id}.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+        if sample_count is None:
+            sample_count = min(self.DEFAULT_PDP_SAMPLE_COUNT, len(eligible))
+        if sample_count > len(eligible):
+            raise ValueError(
+                f"Sample count {sample_count} exceeds the {len(eligible)} sectors "
+                f"assigned to node {node_id}."
+            )
+
+        nonce = secrets.token_hex(32)
+        selected = secrets.SystemRandom().sample(eligible, sample_count)
+        challenges = [
+            {
+                **sector,
+                "coefficient_hex": format(
+                    secrets.randbits(StoragePDP.COEFFICIENT_BITS) or 1,
+                    "x",
+                ),
+            }
+            for sector in selected
+        ]
+        public_challenges = [
+            {
+                "sector_index": item["sector_index"],
+                "coefficient": int(item["coefficient_hex"], 16),
+            }
+            for item in challenges
+        ]
+        payload = {
+            "file_id": file_id,
+            "nonce_hex": nonce,
+            "n": pdp_metadata.get("n"),
+            "sectors": challenges,
+        }
+
+        try:
+            response = self.network.request_pdp_proof(node_id, payload)
+        except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as error:
+            return VerificationResult(
+                status=VerificationStatus.WARNING,
+                message=f"Could not complete the PDP challenge with node {node_id}: {error}",
+                details={"node_id": node_id, "sample_count": sample_count},
+                cid=cid_str,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+
+        proof_valid = False
+        if (
+            isinstance(response, dict)
+            and response.get("nonce_hex") == nonce
+            and isinstance(response.get("sector_count"), int)
+            and not isinstance(response.get("sector_count"), bool)
+            and response.get("sector_count") == sample_count
+            and isinstance(response.get("sigma_hex"), str)
+            and isinstance(response.get("mu_hex"), str)
+            and re.fullmatch(r"[0-9a-f]{1,1024}", response["sigma_hex"])
+            and re.fullmatch(r"[0-9a-f]{1,296}", response["mu_hex"])
+        ):
+            try:
+                sigma = int(response["sigma_hex"], 16)
+                mu = int(response["mu_hex"], 16)
+            except ValueError:
+                sigma = mu = -1
+            proof_valid = StoragePDP.verify_aggregate_proof(
+                file_id,
+                public_challenges,
+                sigma,
+                mu,
+                pdp_metadata,
+            )
+
+        elapsed = (time.time() - start) * 1000
+        status = VerificationStatus.PASSED if proof_valid else VerificationStatus.FAILED
+        return VerificationResult(
+            status=status,
+            message=(
+                f"RSA-PDP challenge {'PASSED' if proof_valid else 'FAILED'}: "
+                f"Node {node_id} returned an aggregate proof for "
+                f"{sample_count} sector(s)."
+            ),
+            details={
+                "node_id": node_id,
+                "scheme": StoragePDP.SCHEME,
+                "sample_count": sample_count,
+                "sector_indices": [item["sector_index"] for item in challenges],
+                "nonce_hex": nonce,
+                "proof_valid": proof_valid,
+                "data_bytes_returned": 0,
+            },
+            cid=cid_str,
+            elapsed_ms=elapsed,
+        )
+
+    # ── 7. Network-wide audit ───────────────────────────────────────
 
     def audit_network(self, manifest: dict) -> VerificationResult:
         """
@@ -547,7 +949,7 @@ class IntegrityVerifier:
                 elapsed_ms=elapsed,
             )
 
-    # ── 6. Tamper simulation (for testing) ──────────────────────────
+    # ── 8. Tamper simulation (for testing) ──────────────────────────
 
     def simulate_corruption(self, manifest: dict, chunk_index: int) -> bool:
         """

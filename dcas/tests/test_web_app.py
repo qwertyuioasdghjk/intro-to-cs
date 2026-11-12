@@ -110,6 +110,36 @@ class TestWebApp(unittest.TestCase):
         status_after_recovery = self.client.get("/api/network/status").get_json()
         self.assertEqual(status_after_recovery["online_nodes"], 2)
 
+    def test_api_checks_rsa_pdp_node_possession(self):
+        uploaded = self.client.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(b"node retrievability API"), "sample.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(uploaded.status_code, 201)
+        cid = uploaded.get_json()["cid"]
+        manifest = self.app.extensions["dcas"]["metadata"].get_manifest(cid)
+        node_id = manifest["placements"][0]["stored_on"][0]
+
+        checked = self.client.post(
+            f"/api/verify/{cid}/nodes/{node_id}",
+            json={"sample_count": 1},
+        )
+        self.assertEqual(checked.status_code, 200)
+        self.assertEqual(checked.get_json()["status"], "PASSED")
+        self.assertEqual(checked.get_json()["details"]["sample_count"], 1)
+        self.assertEqual(checked.get_json()["details"]["data_bytes_returned"], 0)
+        self.assertEqual(
+            checked.get_json()["details"]["scheme"],
+            "dcas-rsa-pdp-edu-v1",
+        )
+
+        invalid = self.client.post(
+            f"/api/verify/{cid}/nodes/{node_id}",
+            json={"sample_count": 0},
+        )
+        self.assertEqual(invalid.status_code, 400)
+
     def test_shared_space_is_encrypted_and_access_is_revocable(self):
         self.assertEqual(self.client.get("/share/example").status_code, 200)
         created = self.client.post("/api/spaces", json={"name": "Research group"})
@@ -170,6 +200,10 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/file/{cid}").status_code, 404)
         self.assertEqual(self.client.get(f"/api/download/{cid}").status_code, 404)
         self.assertEqual(self.client.post(f"/api/verify/{cid}").status_code, 404)
+        self.assertEqual(
+            self.client.post(f"/api/verify/{cid}/nodes/node-000").status_code,
+            404,
+        )
         self.assertEqual(self.client.get(f"/api/search?q=private").get_json()["count"], 0)
         public_upload = self.client.post(
             "/api/upload",

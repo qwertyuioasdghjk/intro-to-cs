@@ -16,6 +16,7 @@ Endpoints:
     POST   /api/verify/<cid>   Verify file integrity
     POST   /api/verify/<cid>/chunks     Verify individual chunks
     POST   /api/verify/<cid>/merkle/<n> Verify Merkle proof for chunk n
+    POST   /api/verify/<cid>/nodes/<node_id>  Run an RSA-PDP node challenge
     POST   /api/verify/<cid>/audit      Full network audit
     GET    /api/network/status  Network status
     POST   /api/network/fail/<node_id>  Simulate node failure
@@ -39,6 +40,7 @@ from ..verifier.verifier import IntegrityVerifier
 from ..database.metadata import MetadataStore
 from ..database.mongo_metadata import MongoMetadataStore
 from ..storage.encryption import StorageEncryptor, StorageEncryptionError
+from ..storage.pdp import StoragePDP
 
 
 def create_app(
@@ -48,6 +50,7 @@ def create_app(
     replication_factor: int = 2,
     mongodb_uri: str | None = None,
     mongodb_database: str | None = None,
+    node_urls: dict[str, str] | None = None,
 ) -> Flask:
     """
     Create and configure the Flask application.
@@ -57,6 +60,7 @@ def create_app(
         db_path:            Path to the SQLite database when MongoDB is not configured.
         num_nodes:          Number of storage nodes.
         replication_factor: Chunks are replicated to this many nodes.
+        node_urls:          Optional retrieval-service URLs keyed by node ID.
         mongodb_uri:        MongoDB URI; defaults to DCAS_MONGODB_URI.
         mongodb_database:   MongoDB database name; defaults to DCAS_MONGODB_DATABASE or "dcas".
 
@@ -74,10 +78,13 @@ def create_app(
         return response
 
     # Initialize components
+    pdp = StoragePDP.from_config(network_dir)
     network = StorageNetwork(
         base_dir=network_dir,
         num_nodes=num_nodes,
         replication_factor=replication_factor,
+        node_urls=node_urls,
+        pdp=pdp,
     )
     storage_encryptor = StorageEncryptor.from_config(network.base_dir)
     verifier = IntegrityVerifier(network, storage_encryptor=storage_encryptor)
@@ -95,6 +102,7 @@ def create_app(
     app.extensions["dcas"] = {
         "network": network,
         "storage_encryptor": storage_encryptor,
+        "pdp": pdp,
         "verifier": verifier,
         "metadata": metadata,
     }
@@ -452,6 +460,48 @@ def create_app(
             manifest["filename"],
             result.message,
             status="success" if result.passed else "failure",
+        )
+        return jsonify(result.to_dict())
+
+    @app.route("/api/verify/<cid>/nodes/<node_id>", methods=["POST"])
+    def challenge_node(cid, node_id):
+        """Verify an RSA-PDP aggregate challenge for a node's assigned file sectors."""
+        denied = private_file_response(cid)
+        if denied:
+            return denied
+        manifest = metadata.get_manifest(cid)
+        if manifest is None:
+            return jsonify({"error": "File not found"}), 404
+
+        data = request.get_json(silent=True)
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            return jsonify({"error": "Request body must be an object"}), 400
+        sample_count = data.get("sample_count")
+        if sample_count is not None and (
+            not isinstance(sample_count, int)
+            or isinstance(sample_count, bool)
+            or sample_count < 1
+            or sample_count > 64
+        ):
+            return jsonify({"error": "'sample_count' must be an integer from 1 to 64"}), 400
+
+        try:
+            result = verifier.prove_node_possession(
+                node_id,
+                manifest,
+                sample_count=sample_count,
+            )
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        metadata.log_event(
+            "NODE_PDP_CHALLENGE",
+            cid,
+            manifest["filename"],
+            result.message,
+            status="success" if result.passed else "failure",
+            node_id=node_id,
         )
         return jsonify(result.to_dict())
 

@@ -5,12 +5,16 @@ Tests all core components: hashing, CID generation, chunking,
 Merkle trees, storage network, integrity verification, and metadata.
 """
 
+import io
 import os
 import sys
 import json
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,6 +25,8 @@ from dcas.core.chunker import FileChunker, Chunk
 from dcas.core.merkle import MerkleTree, MerkleProof
 from dcas.storage.node import StorageNode
 from dcas.storage.network import StorageNetwork
+from dcas.storage.node_server import create_node_app
+from dcas.storage.pdp import StoragePDP
 from dcas.verifier.verifier import IntegrityVerifier, VerificationStatus
 from dcas.database.metadata import MetadataStore
 
@@ -478,23 +484,140 @@ class TestIntegrityVerifier(unittest.TestCase):
         result = self.verifier.verify_merkle_proof(manifest, 0)
         self.assertEqual(result.status, VerificationStatus.PASSED)
 
-    def test_challenge_node(self):
-        """Storage proof challenge succeeds."""
+    def test_node_retrievability_check_passes_for_intact_chunk(self):
+        """A node returns a random sampled chunk matching its committed hash."""
         manifest = self.network.store_bytes(b"Challenge test")
-        chunk_hash = manifest["placements"][0]["chunk_hash"]
         node_id = manifest["placements"][0]["stored_on"][0]
-        result = self.verifier.challenge_node(node_id, chunk_hash)
+        result = self.verifier.check_node_retrievability(node_id, manifest)
         self.assertEqual(result.status, VerificationStatus.PASSED)
+        self.assertEqual(result.details["sample_count"], 1)
+        self.assertEqual(len(result.details["samples_checked"]), 1)
 
-    def test_challenge_offline_node(self):
-        """Challenging an offline node returns WARNING."""
+    def test_node_retrievability_check_detects_corrupted_chunk(self):
+        """A node returning altered bytes fails the committed hash check."""
+        manifest = self.network.store_bytes(b"Corrupted challenge test")
+        node_id = manifest["placements"][0]["stored_on"][0]
+        self.verifier.simulate_corruption(manifest, 0)
+
+        result = self.verifier.check_node_retrievability(node_id, manifest)
+
+        self.assertEqual(result.status, VerificationStatus.FAILED)
+        self.assertEqual(result.details["samples_checked"][0]["status"], "FAILED")
+
+    def test_node_retrievability_check_uses_remote_service(self):
+        manifest = self.network.store_bytes(b"Remote node sample")
+        node_id = manifest["placements"][0]["stored_on"][0]
+        node = self.network._get_node(node_id)
+        self.assertIsNotNone(node)
+
+        node_client = create_node_app(node_id, node.storage_dir).test_client()
+        self.assertEqual(node_client.get("/v1/chunks/not-a-hash").status_code, 400)
+        self.assertEqual(node_client.get(f"/v1/chunks/{'0' * 64}").status_code, 404)
+
+        class InMemoryNodeHTTP:
+            def open(opener, request, timeout):
+                self.assertEqual(request.method, "GET")
+                self.assertEqual(timeout, 5)
+                response = node_client.get(urlsplit(request.full_url).path)
+                if response.status_code == 404:
+                    raise HTTPError(request.full_url, 404, "Not found", {}, None)
+                if response.status_code != 200:
+                    raise AssertionError(f"Node service returned {response.status_code}")
+                return io.BytesIO(response.data)
+
+        self.network.node_urls[node_id] = "http://node-service.test"
+        with patch("dcas.storage.network.build_opener", return_value=InMemoryNodeHTTP()):
+            result = self.verifier.check_node_retrievability(node_id, manifest)
+
+        self.assertEqual(result.status, VerificationStatus.PASSED)
+        self.assertEqual(result.details["samples_checked"][0]["status"], "PASSED")
+
+    def test_node_retrievability_check_offline_node(self):
+        """Checking an offline node returns WARNING."""
         manifest = self.network.store_bytes(b"Offline test")
         node_id = manifest["placements"][0]["stored_on"][0]
-        chunk_hash = manifest["placements"][0]["chunk_hash"]
         self.network.simulate_node_failure(node_id)
-        result = self.verifier.challenge_node(node_id, chunk_hash)
+        result = self.verifier.check_node_retrievability(node_id, manifest)
         self.assertEqual(result.status, VerificationStatus.WARNING)
         self.network.simulate_node_recovery(node_id)
+
+    def test_node_retrievability_check_rejects_invalid_sample_count(self):
+        manifest = self.network.store_bytes(b"Sample count")
+        node_id = manifest["placements"][0]["stored_on"][0]
+
+        with self.assertRaises(ValueError):
+            self.verifier.check_node_retrievability(node_id, manifest, sample_count=0)
+
+        with self.assertRaises(ValueError):
+            self.verifier.check_node_retrievability(node_id, manifest, sample_count=2)
+
+    def test_challenge_node_verifies_sampled_merkle_proofs(self):
+        """A node's sampled chunk bytes and stored Merkle paths verify."""
+        manifest = self.network.store_bytes(b"Challenge proof test " * 40000)
+        node_counts = {
+            node.node_id: sum(
+                node.node_id in placement["stored_on"]
+                for placement in manifest["placements"]
+            )
+            for node in self.network.nodes
+        }
+        node_id = max(node_counts, key=node_counts.get)
+
+        result = self.verifier.challenge_node(node_id, manifest, sample_count=2)
+
+        self.assertEqual(result.status, VerificationStatus.PASSED)
+        self.assertEqual(result.details["sample_count"], 2)
+        self.assertEqual(len(result.details["nonce_hex"]), 64)
+        self.assertTrue(all(
+            sample["status"] == "PASSED"
+            for sample in result.details["samples_checked"]
+        ))
+
+    def test_challenge_node_fails_on_invalid_merkle_path(self):
+        """A chunk hash alone is insufficient without its committed Merkle path."""
+        manifest = self.network.store_bytes(b"Challenge mismatch test " * 40000)
+        node_id = manifest["placements"][0]["stored_on"][0]
+        node = self.network._get_node(node_id)
+        for placement in manifest["placements"]:
+            if node_id not in placement["stored_on"]:
+                continue
+            proof = node._metadata[placement["chunk_hash"]]["merkle_proofs"][
+                manifest["merkle_root"]
+            ][str(placement["chunk_index"])]
+            proof["proof_hashes"] = []
+
+        result = self.verifier.challenge_node(node_id, manifest)
+
+        self.assertEqual(result.status, VerificationStatus.FAILED)
+        self.assertEqual(result.details["samples_checked"][0]["status"], "FAILED")
+
+    def test_challenge_node_uses_remote_merkle_challenge_service(self):
+        manifest = self.network.store_bytes(b"Remote Merkle challenge " * 30000)
+        node_id = manifest["placements"][0]["stored_on"][0]
+        node = self.network._get_node(node_id)
+        node_client = create_node_app(node_id, node.storage_dir).test_client()
+
+        class InMemoryNodeHTTP:
+            def open(inner_self, request, timeout):
+                self.assertEqual(request.method, "POST")
+                self.assertEqual(timeout, 5)
+                response = node_client.post(
+                    urlsplit(request.full_url).path,
+                    data=request.data,
+                    content_type="application/json",
+                )
+                if response.status_code == 404:
+                    raise HTTPError(request.full_url, 404, "Not found", {}, None)
+                if response.status_code != 200:
+                    raise AssertionError(f"Node service returned {response.status_code}")
+                return io.BytesIO(response.data)
+
+        self.network.node_urls[node_id] = "http://node-service.test"
+        with patch("dcas.storage.network.build_opener", return_value=InMemoryNodeHTTP()):
+            result = self.verifier.challenge_node(node_id, manifest)
+
+        self.assertEqual(result.status, VerificationStatus.PASSED)
+        self.assertEqual(result.details["samples_checked"][0]["status"], "PASSED")
 
     def test_full_audit_pass(self):
         """Full network audit passes for healthy data."""
@@ -508,6 +631,113 @@ class TestIntegrityVerifier(unittest.TestCase):
         self.verifier.simulate_corruption(manifest, 0)
         result = self.verifier.audit_network(manifest)
         self.assertEqual(result.status, VerificationStatus.FAILED)
+
+
+class TestStoragePDP(unittest.TestCase):
+    """Tests for the educational RSA proof-of-data-possession protocol."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.pdp = StoragePDP.from_config(self.test_dir)
+        self.network = StorageNetwork(
+            base_dir=os.path.join(self.test_dir, "network"),
+            num_nodes=3,
+            replication_factor=2,
+            pdp=self.pdp,
+        )
+        self.verifier = IntegrityVerifier(self.network)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_pdp_verifies_aggregate_without_returning_file_blocks(self):
+        data = bytes(range(256)) * 2
+        manifest = self.network.store_bytes(data)
+        node_id = manifest["placements"][0]["stored_on"][0]
+
+        result = self.verifier.prove_node_possession(node_id, manifest, sample_count=2)
+
+        self.assertEqual(result.status, VerificationStatus.PASSED)
+        self.assertEqual(result.details["data_bytes_returned"], 0)
+        self.assertNotIn("data_base64", result.details)
+        self.assertEqual(result.details["scheme"], StoragePDP.SCHEME)
+
+    def test_pdp_handles_empty_files_and_repeated_uploads(self):
+        manifest = self.network.store_bytes(b"")
+        repeated_manifest = self.network.store_bytes(b"")
+        node_id = repeated_manifest["placements"][0]["stored_on"][0]
+
+        result = self.verifier.prove_node_possession(node_id, repeated_manifest)
+
+        self.assertEqual(manifest["cid"]["cid"], repeated_manifest["cid"]["cid"])
+        self.assertEqual(result.status, VerificationStatus.PASSED)
+
+    def test_pdp_rejects_tampered_authenticator(self):
+        manifest = self.network.store_bytes(b"Tamper PDP authenticator " * 20)
+        node_id = manifest["placements"][0]["stored_on"][0]
+        for placement in manifest["placements"]:
+            if node_id not in placement["stored_on"]:
+                continue
+            node = self.network._get_node(node_id)
+            node._metadata[placement["chunk_hash"]]["pdp_tags"][
+                manifest["pdp"]["file_id"]
+            ] = {
+                index: "1"
+                for index in node._metadata[placement["chunk_hash"]]["pdp_tags"][
+                    manifest["pdp"]["file_id"]
+                ]
+            }
+
+        result = self.verifier.prove_node_possession(node_id, manifest)
+
+        self.assertEqual(result.status, VerificationStatus.FAILED)
+
+    def test_pdp_requires_upload_time_tags(self):
+        legacy_network = StorageNetwork(
+            base_dir=os.path.join(self.test_dir, "legacy"),
+            num_nodes=2,
+            replication_factor=1,
+        )
+        manifest = legacy_network.store_bytes(b"Legacy file without PDP tags")
+
+        result = self.verifier.prove_node_possession(
+            manifest["placements"][0]["stored_on"][0],
+            manifest,
+        )
+
+        self.assertEqual(result.status, VerificationStatus.ERROR)
+        self.assertIn("no RSA-PDP tags", result.message)
+
+    def test_pdp_survives_node_service_reload(self):
+        manifest = self.network.store_bytes(b"Remote PDP challenge " * 20)
+        node_id = manifest["placements"][0]["stored_on"][0]
+        node = self.network._get_node(node_id)
+        node_client = create_node_app(node_id, node.storage_dir).test_client()
+
+        class InMemoryNodeHTTP:
+            def open(inner_self, request, timeout):
+                self.assertEqual(request.method, "POST")
+                self.assertEqual(timeout, 5)
+                response = node_client.post(
+                    urlsplit(request.full_url).path,
+                    data=request.data,
+                    content_type="application/json",
+                )
+                if response.status_code == 404:
+                    raise HTTPError(request.full_url, 404, "Not found", {}, None)
+                if response.status_code != 200:
+                    raise AssertionError(f"Node service returned {response.status_code}")
+                return io.BytesIO(response.data)
+
+        self.network.node_urls[node_id] = "http://node-service.test"
+        with patch("dcas.storage.network.build_opener", return_value=InMemoryNodeHTTP()):
+            result = self.verifier.prove_node_possession(node_id, manifest)
+
+        self.assertEqual(result.status, VerificationStatus.PASSED)
+
+    def test_pdp_key_is_stable_across_restarts(self):
+        reloaded = StoragePDP.from_config(self.test_dir)
+        self.assertEqual(reloaded.public_parameters, self.pdp.public_parameters)
 
 
 class TestMetadataStore(unittest.TestCase):

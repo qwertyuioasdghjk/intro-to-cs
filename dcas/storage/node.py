@@ -12,6 +12,8 @@ import shutil
 from datetime import datetime, timezone
 from typing import Optional
 
+from .pdp import StoragePDP
+
 
 class StorageNode:
     """
@@ -85,10 +87,9 @@ class StorageNode:
         with open(chunk_path, "wb") as f:
             f.write(data)
 
-        self._metadata[chunk_hash] = {
-            "size": len(data),
-            "stored_at": datetime.now(timezone.utc).isoformat(),
-        }
+        chunk_metadata = self._metadata.setdefault(chunk_hash, {})
+        chunk_metadata["size"] = len(data)
+        chunk_metadata["stored_at"] = datetime.now(timezone.utc).isoformat()
         self._save_metadata()
         return True
 
@@ -117,6 +118,167 @@ class StorageNode:
         if not self.is_online:
             return False
         return os.path.exists(os.path.join(self.storage_dir, chunk_hash))
+
+    def store_merkle_proof(
+        self,
+        chunk_hash: str,
+        merkle_root: str,
+        proof: dict,
+    ) -> bool:
+        """Persist a Merkle inclusion path for a chunk; return whether it was new."""
+        if not self.has_chunk(chunk_hash):
+            return False
+
+        root_proofs = self._metadata[chunk_hash].setdefault("merkle_proofs", {})
+        index = str(proof["leaf_index"])
+        existing = root_proofs.setdefault(merkle_root, {}).get(index)
+        if existing is not None:
+            if existing != proof:
+                raise ValueError("Conflicting Merkle proof already stored for this chunk.")
+            return False
+
+        root_proofs[merkle_root][index] = proof
+        self._save_metadata()
+        return True
+
+    def remove_merkle_proof(self, chunk_hash: str, merkle_root: str, leaf_index: int):
+        """Remove a newly added Merkle proof when a storage operation rolls back."""
+        chunk_metadata = self._metadata.get(chunk_hash)
+        if chunk_metadata is None:
+            return
+
+        root_proofs = chunk_metadata.get("merkle_proofs", {})
+        proofs = root_proofs.get(merkle_root, {})
+        proofs.pop(str(leaf_index), None)
+        if not proofs:
+            root_proofs.pop(merkle_root, None)
+        if not root_proofs:
+            chunk_metadata.pop("merkle_proofs", None)
+        self._save_metadata()
+
+    def retrieve_chunk_with_proof(
+        self,
+        chunk_hash: str,
+        merkle_root: str,
+        leaf_index: int,
+    ) -> Optional[tuple[bytes, dict]]:
+        """Return stored chunk bytes and its inclusion path for a specific file root."""
+        chunk_data = self.retrieve_chunk(chunk_hash)
+        if chunk_data is None:
+            return None
+
+        proof = (
+            self._metadata.get(chunk_hash, {})
+            .get("merkle_proofs", {})
+            .get(merkle_root, {})
+            .get(str(leaf_index))
+        )
+        if proof is None:
+            return None
+        return chunk_data, proof
+
+    def store_pdp_tag(
+        self,
+        chunk_hash: str,
+        file_id: str,
+        sector_index: int,
+        tag: str,
+    ) -> bool:
+        """Persist a homomorphic authenticator for one file sector."""
+        if not self.has_chunk(chunk_hash):
+            return False
+
+        tags = self._metadata[chunk_hash].setdefault("pdp_tags", {})
+        file_tags = tags.setdefault(file_id, {})
+        index = str(sector_index)
+        existing = file_tags.get(index)
+        if existing is not None:
+            if existing != tag:
+                raise ValueError("Conflicting PDP tag already stored for this sector.")
+            return False
+
+        file_tags[index] = tag
+        self._save_metadata()
+        return True
+
+    def remove_pdp_tag(self, chunk_hash: str, file_id: str, sector_index: int):
+        """Remove a newly added PDP tag when a storage operation rolls back."""
+        chunk_metadata = self._metadata.get(chunk_hash)
+        if chunk_metadata is None:
+            return
+
+        tags = chunk_metadata.get("pdp_tags", {})
+        file_tags = tags.get(file_id, {})
+        file_tags.pop(str(sector_index), None)
+        if not file_tags:
+            tags.pop(file_id, None)
+        if not tags:
+            chunk_metadata.pop("pdp_tags", None)
+        self._save_metadata()
+
+    def respond_to_pdp_challenge(self, payload: dict) -> Optional[dict]:
+        """Return a compact RSA-PDP aggregate proof without returning sector bytes."""
+        if not self.is_online:
+            return None
+
+        file_id = payload["file_id"]
+        nonce_hex = payload["nonce_hex"]
+        modulus = int(payload["n"], 16)
+        sectors = payload["sectors"]
+        if not isinstance(sectors, list) or not 1 <= len(sectors) <= 64:
+            raise ValueError("A PDP challenge must include between 1 and 64 sectors.")
+
+        sigma = 1
+        mu = 0
+        seen_indices = set()
+        for item in sectors:
+            sector_index = item["sector_index"]
+            coefficient = int(item["coefficient_hex"], 16)
+            chunk_offset = item["chunk_offset"]
+            length = item["length"]
+            if (
+                not isinstance(sector_index, int)
+                or isinstance(sector_index, bool)
+                or sector_index < 0
+                or sector_index in seen_indices
+                or not isinstance(chunk_offset, int)
+                or isinstance(chunk_offset, bool)
+                or chunk_offset < 0
+                or not isinstance(length, int)
+                or isinstance(length, bool)
+                or not 0 <= length <= StoragePDP.SECTOR_SIZE
+                or not 1 <= coefficient < 2 ** StoragePDP.COEFFICIENT_BITS
+            ):
+                raise ValueError("Invalid PDP challenge sector.")
+            seen_indices.add(sector_index)
+
+            chunk_hash = item["chunk_hash"]
+            chunk_data = self.retrieve_chunk(chunk_hash)
+            tag = (
+                self._metadata.get(chunk_hash, {})
+                .get("pdp_tags", {})
+                .get(file_id, {})
+                .get(str(sector_index))
+            )
+            if chunk_data is None or tag is None:
+                return None
+
+            sector_data = chunk_data[chunk_offset:chunk_offset + length]
+            if len(sector_data) != length:
+                return None
+            tag_value = int(tag, 16)
+            if not 1 <= tag_value < modulus:
+                return None
+
+            sigma = sigma * pow(tag_value, coefficient, modulus) % modulus
+            mu += coefficient * StoragePDP.message_value(sector_data)
+
+        return {
+            "nonce_hex": nonce_hex,
+            "sector_count": len(sectors),
+            "sigma_hex": format(sigma, "x"),
+            "mu_hex": format(mu, "x"),
+        }
 
     def delete_chunk(self, chunk_hash: str) -> bool:
         """

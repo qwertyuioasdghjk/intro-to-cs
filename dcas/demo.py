@@ -280,12 +280,12 @@ def demo_integrity_verification(network: StorageNetwork, manifests: dict):
             border_style="blue",
         ))
 
-    # ── 6d. Storage proof (challenge-response) ──────────────────────
-    console.print(f"\n[bold cyan]6d. Storage Proof (Challenge-Response)[/]\n")
+    # ── 6d. Node retrievability check ────────────────────────────────
+    console.print(f"\n[bold cyan]6d. Node Retrievability Check[/]\n")
 
     chunk_hash = cert_manifest["placements"][0]["chunk_hash"]
     node_id = cert_manifest["placements"][0]["stored_on"][0]
-    result = verifier.challenge_node(node_id, chunk_hash)
+    result = verifier.check_node_retrievability(node_id, cert_manifest)
     console.print(f"  {'OK' if result.passed else 'FAIL'} {result.message}")
 
     return verifier

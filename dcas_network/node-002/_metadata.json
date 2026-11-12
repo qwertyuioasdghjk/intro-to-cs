@@ -1,0 +1,48 @@
+{
+  "b619e3e04cffbe79fdc6b131a311b42b1a2435fda9e1fae180023de25c88e216": {
+    "size": 262144,
+    "stored_at": "2026-11-12T15:50:49.414463+00:00",
+    "merkle_proofs": {
+      "8cc92bea7914f82425d4fd11da0f0853132185d1fbe0f4f6fcbbc4dad21ddb85": {
+        "1": {
+          "leaf_hash": "b619e3e04cffbe79fdc6b131a311b42b1a2435fda9e1fae180023de25c88e216",
+          "leaf_index": 1,
+          "proof_hashes": [
+            [
+              "0f91c945dc520766cd918bf6162ca18c6ba1f98aca3db5c1720af478d569794c",
+              "left"
+            ],
+            [
+              "0fa8033dd9d021da0dbc8c72bcaf6797affbc53d69a69958ea82569ca6539838",
+              "right"
+            ]
+          ],
+          "root_hash": "8cc92bea7914f82425d4fd11da0f0853132185d1fbe0f4f6fcbbc4dad21ddb85"
+        }
+      }
+    }
+  },
+  "ee7ba58ef45aa1d2b6ded58dd27d91a525f9a2ad2742e034a3c5a727a5d30a99": {
+    "size": 195712,
+    "stored_at": "2026-11-12T15:50:49.416262+00:00",
+    "merkle_proofs": {
+      "8cc92bea7914f82425d4fd11da0f0853132185d1fbe0f4f6fcbbc4dad21ddb85": {
+        "2": {
+          "leaf_hash": "ee7ba58ef45aa1d2b6ded58dd27d91a525f9a2ad2742e034a3c5a727a5d30a99",
+          "leaf_index": 2,
+          "proof_hashes": [
+            [
+              "ee7ba58ef45aa1d2b6ded58dd27d91a525f9a2ad2742e034a3c5a727a5d30a99",
+              "right"
+            ],
+            [
+              "310a455e98284e3425b064c4415063b6c8cb69b549340dc3886d427a97ec3ef7",
+              "left"
+            ]
+          ],
+          "root_hash": "8cc92bea7914f82425d4fd11da0f0853132185d1fbe0f4f6fcbbc4dad21ddb85"
+        }
+      }
+    }
+  }
+}
