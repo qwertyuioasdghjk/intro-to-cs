@@ -2,3 +2,4 @@ Flask>=3,<4
 rich>=13,<15
 pymongo>=4.6,<5
 cryptography>=42,<48
+py-ecc>=8.0.0,<9

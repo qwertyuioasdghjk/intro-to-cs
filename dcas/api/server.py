@@ -16,7 +16,7 @@ Endpoints:
     POST   /api/verify/<cid>   Verify file integrity
     POST   /api/verify/<cid>/chunks     Verify individual chunks
     POST   /api/verify/<cid>/merkle/<n> Verify Merkle proof for chunk n
-    POST   /api/verify/<cid>/nodes/<node_id>  Run an RSA-PDP node challenge
+    POST   /api/verify/<cid>/nodes/<node_id>  Run a pairing-PoR node challenge
     POST   /api/verify/<cid>/audit      Full network audit
     GET    /api/network/status  Network status
     POST   /api/network/fail/<node_id>  Simulate node failure
@@ -40,7 +40,7 @@ from ..verifier.verifier import IntegrityVerifier
 from ..database.metadata import MetadataStore
 from ..database.mongo_metadata import MongoMetadataStore
 from ..storage.encryption import StorageEncryptor, StorageEncryptionError
-from ..storage.pdp import StoragePDP
+from ..storage.por import PairingPoR
 
 
 def create_app(
@@ -59,7 +59,7 @@ def create_app(
         network_dir:        Base directory for storage nodes.
         db_path:            Path to the SQLite database when MongoDB is not configured.
         num_nodes:          Number of storage nodes.
-        replication_factor: Chunks are replicated to this many nodes.
+        replication_factor: Legacy setting; PoR stores one shard per distinct node.
         node_urls:          Optional retrieval-service URLs keyed by node ID.
         mongodb_uri:        MongoDB URI; defaults to DCAS_MONGODB_URI.
         mongodb_database:   MongoDB database name; defaults to DCAS_MONGODB_DATABASE or "dcas".
@@ -77,17 +77,26 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
         return response
 
+    if num_nodes < 3:
+        raise ValueError("The 2-of-3 PoR storage mode requires at least three nodes.")
+    if replication_factor < 1:
+        raise ValueError("The legacy replication setting must be positive.")
+
     # Initialize components
-    pdp = StoragePDP.from_config(network_dir)
+    pairing_por = PairingPoR.from_config(network_dir)
     network = StorageNetwork(
         base_dir=network_dir,
         num_nodes=num_nodes,
-        replication_factor=replication_factor,
+        replication_factor=1,
         node_urls=node_urls,
-        pdp=pdp,
+        pairing_por=pairing_por,
     )
     storage_encryptor = StorageEncryptor.from_config(network.base_dir)
-    verifier = IntegrityVerifier(network, storage_encryptor=storage_encryptor)
+    verifier = IntegrityVerifier(
+        network,
+        storage_encryptor=storage_encryptor,
+        pairing_por_required=True,
+    )
     mongodb_uri = mongodb_uri if mongodb_uri is not None else os.environ.get("DCAS_MONGODB_URI")
     mongodb_database = (
         mongodb_database
@@ -102,7 +111,7 @@ def create_app(
     app.extensions["dcas"] = {
         "network": network,
         "storage_encryptor": storage_encryptor,
-        "pdp": pdp,
+        "pairing_por": pairing_por,
         "verifier": verifier,
         "metadata": metadata,
     }
@@ -145,6 +154,21 @@ def create_app(
         if info and info.get("space_id"):
             return jsonify({"error": "File not found"}), 404
         return None
+
+    def retire_replaced_chunks(old_manifest: dict | None, cid: str):
+        if old_manifest is None:
+            return
+        referenced_hashes = set()
+        for file_info in metadata.list_files(include_private=True):
+            if file_info["cid"] == cid:
+                continue
+            other_manifest = metadata.get_manifest(file_info["cid"])
+            if other_manifest is not None:
+                referenced_hashes.update(
+                    placement["chunk_hash"]
+                    for placement in other_manifest.get("placements", [])
+                )
+        network.delete_file_chunks(old_manifest, referenced_hashes)
 
     @app.route("/api/spaces", methods=["POST"])
     def create_shared_space():
@@ -207,7 +231,7 @@ def create_app(
             return jsonify({"error": "Shared-space uploads must use the DCAS1 client-side envelope"}), 400
         try:
             stored_data = storage_encryptor.encrypt(file_data)
-            manifest = network.store_bytes(stored_data, filename=file.filename)
+            manifest = network.store_por_bytes(stored_data, filename=file.filename)
         except RuntimeError as error:
             return jsonify({"error": str(error)}), 503
 
@@ -306,19 +330,50 @@ def create_app(
         source_fingerprint = storage_encryptor.fingerprint(file_data)
         if metadata.has_shared_source_fingerprint(source_fingerprint):
             return jsonify({"error": "This content belongs to a shared space and cannot be uploaded publicly"}), 409
-
-        # Store in network
-        try:
-            manifest = network.store_bytes(file_data, filename=file.filename)
-        except RuntimeError as error:
-            return jsonify({"error": str(error)}), 503
-
-        existing = metadata.get_file_info(manifest["cid"]["cid"])
+        source_cid = network.cid_generator.generate(file_data)
+        existing = metadata.get_file_info(source_cid.cid_string)
+        old_manifest = metadata.get_manifest(source_cid.cid_string)
         if existing and existing.get("space_id"):
             return jsonify({"error": "This content belongs to a shared space and cannot be replaced"}), 409
+        if (
+            old_manifest
+            and old_manifest.get("storage_encrypted")
+            and old_manifest.get("cid_hash_is_client_content")
+            and isinstance(old_manifest.get("por"), dict)
+            and old_manifest["por"].get("scheme") == PairingPoR.SCHEME
+        ):
+            old_manifest["filename"] = file.filename
+            metadata.store_manifest(old_manifest, owner=owner, tags=tags)
+            return jsonify({
+                "message": "File uploaded and distributed successfully.",
+                "cid": old_manifest["cid"]["cid"],
+                "hash_digest": old_manifest["cid"]["hash_digest"],
+                "filename": old_manifest["filename"],
+                "total_size": old_manifest["total_size"],
+                "chunk_count": old_manifest["chunk_count"],
+                "merkle_root": old_manifest["merkle_root"],
+                "replication_factor": old_manifest["replication_factor"],
+            }), 201
+
+        # Encrypt before storage-node distribution; PoR tags cover ciphertext shards.
+        try:
+            stored_data = storage_encryptor.encrypt(file_data)
+            manifest = network.store_por_bytes(
+                stored_data,
+                filename=file.filename,
+                cid_override=source_cid,
+            )
+        except RuntimeError as error:
+            return jsonify({"error": str(error)}), 503
+        manifest["storage_size"] = manifest["total_size"]
+        manifest["total_size"] = len(file_data)
+        manifest["storage_encrypted"] = True
+        manifest["cid_hash_is_client_content"] = True
+        manifest["source_fingerprint"] = source_fingerprint
 
         # Store manifest in metadata DB
         metadata.store_manifest(manifest, owner=owner, tags=tags)
+        retire_replaced_chunks(old_manifest, manifest["cid"]["cid"])
 
         return jsonify({
             "message": "File uploaded and distributed successfully.",
@@ -351,15 +406,46 @@ def create_app(
         source_fingerprint = storage_encryptor.fingerprint(content)
         if metadata.has_shared_source_fingerprint(source_fingerprint):
             return jsonify({"error": "This content belongs to a shared space and cannot be uploaded publicly"}), 409
-
-        try:
-            manifest = network.store_bytes(content, filename=filename)
-        except RuntimeError as error:
-            return jsonify({"error": str(error)}), 503
-        existing = metadata.get_file_info(manifest["cid"]["cid"])
+        source_cid = network.cid_generator.generate(content)
+        existing = metadata.get_file_info(source_cid.cid_string)
+        old_manifest = metadata.get_manifest(source_cid.cid_string)
         if existing and existing.get("space_id"):
             return jsonify({"error": "This content belongs to a shared space and cannot be replaced"}), 409
+        if (
+            old_manifest
+            and old_manifest.get("storage_encrypted")
+            and old_manifest.get("cid_hash_is_client_content")
+            and isinstance(old_manifest.get("por"), dict)
+            and old_manifest["por"].get("scheme") == PairingPoR.SCHEME
+        ):
+            old_manifest["filename"] = filename
+            metadata.store_manifest(old_manifest, owner=owner)
+            return jsonify({
+                "message": "Text uploaded successfully.",
+                "cid": old_manifest["cid"]["cid"],
+                "hash_digest": old_manifest["cid"]["hash_digest"],
+                "filename": filename,
+                "total_size": old_manifest["total_size"],
+                "chunk_count": old_manifest["chunk_count"],
+                "merkle_root": old_manifest["merkle_root"],
+            }), 201
+
+        try:
+            stored_data = storage_encryptor.encrypt(content)
+            manifest = network.store_por_bytes(
+                stored_data,
+                filename=filename,
+                cid_override=source_cid,
+            )
+        except RuntimeError as error:
+            return jsonify({"error": str(error)}), 503
+        manifest["storage_size"] = manifest["total_size"]
+        manifest["total_size"] = len(content)
+        manifest["storage_encrypted"] = True
+        manifest["cid_hash_is_client_content"] = True
+        manifest["source_fingerprint"] = source_fingerprint
         metadata.store_manifest(manifest, owner=owner)
+        retire_replaced_chunks(old_manifest, manifest["cid"]["cid"])
 
         return jsonify({
             "message": "Text uploaded successfully.",
@@ -410,6 +496,13 @@ def create_app(
         file_data = network.retrieve_file(manifest)
         if file_data is None:
             return jsonify({"error": "Could not retrieve file from network"}), 500
+        if manifest.get("storage_encrypted"):
+            try:
+                file_data = storage_encryptor.decrypt(file_data)
+            except StorageEncryptionError:
+                return jsonify({
+                    "error": "Stored file could not be decrypted; check the storage key and data integrity."
+                }), 500
 
         metadata.log_event("RETRIEVE", cid, manifest["filename"], "File downloaded")
 
@@ -465,7 +558,7 @@ def create_app(
 
     @app.route("/api/verify/<cid>/nodes/<node_id>", methods=["POST"])
     def challenge_node(cid, node_id):
-        """Verify an RSA-PDP aggregate challenge for a node's assigned file sectors."""
+        """Verify a pairing-PoR challenge for a node's assigned coded shard."""
         denied = private_file_response(cid)
         if denied:
             return denied
@@ -482,10 +575,10 @@ def create_app(
         if sample_count is not None and (
             not isinstance(sample_count, int)
             or isinstance(sample_count, bool)
-            or sample_count < 1
+            or sample_count < 2
             or sample_count > 64
         ):
-            return jsonify({"error": "'sample_count' must be an integer from 1 to 64"}), 400
+            return jsonify({"error": "'sample_count' must be an integer from 2 to 64"}), 400
 
         try:
             result = verifier.prove_node_possession(
@@ -496,7 +589,7 @@ def create_app(
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
         metadata.log_event(
-            "NODE_PDP_CHALLENGE",
+            "NODE_POR_CHALLENGE",
             cid,
             manifest["filename"],
             result.message,

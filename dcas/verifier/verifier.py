@@ -7,7 +7,7 @@ Provides multiple verification modes:
 3. Merkle proof verification — verify a single chunk belongs to a dataset.
 4. Retrievability check — request a chunk from a node and verify its committed hash.
 5. Sampled Merkle challenge — verify selected chunks against the committed root.
-6. RSA-PDP challenge — verify possession of random sectors without downloading them.
+6. Pairing PoR challenge — verify possession of a coded shard without downloading it.
 7. Network-wide audit — verify all chunks across all nodes.
 """
 
@@ -29,6 +29,8 @@ from ..core.chunker import FileChunker
 from ..storage.network import StorageNetwork
 from ..storage.encryption import StorageEncryptor, StorageEncryptionError
 from ..storage.pdp import StoragePDP
+from ..storage.por import PairingPoR
+from ..storage.erasure import XorErasureCode
 
 
 class VerificationStatus(Enum):
@@ -87,6 +89,7 @@ class IntegrityVerifier:
         >>> print(result.status, result.message)
     """
 
+    MIN_PDP_SAMPLE_COUNT = 2
     DEFAULT_PDP_SAMPLE_COUNT = 32
 
     def __init__(
@@ -94,11 +97,13 @@ class IntegrityVerifier:
         network: StorageNetwork,
         algorithm: HashAlgorithm = HashAlgorithm.SHA256,
         storage_encryptor: StorageEncryptor | None = None,
+        pairing_por_required: bool = False,
     ):
         self.network = network
         self.engine = HashEngine(algorithm)
         self.algorithm = algorithm
         self.storage_encryptor = storage_encryptor
+        self.pairing_por_required = pairing_por_required
 
     # ── 1. Full file hash verification ──────────────────────────────
 
@@ -146,7 +151,7 @@ class IntegrityVerifier:
             if self.storage_encryptor is None:
                 return VerificationResult(
                     status=VerificationStatus.ERROR,
-                    message="Cannot verify migrated shared content without the storage key.",
+                    message="Cannot verify encrypted content without the storage key.",
                     cid=cid_str,
                     elapsed_ms=(time.time() - start) * 1000,
                 )
@@ -656,7 +661,7 @@ class IntegrityVerifier:
             elapsed_ms=elapsed,
         )
 
-    # ── 6. RSA proof-of-data-possession ──────────────────────────────
+    # ── 6. Pairing PoR (plus legacy RSA-PDP verification) ───────────
 
     def prove_node_possession(
         self,
@@ -664,10 +669,28 @@ class IntegrityVerifier:
         manifest: dict,
         sample_count: int | None = None,
     ) -> VerificationResult:
-        """Verify an RSA-PDP aggregate proof without downloading challenged sectors."""
+        """Verify a pairing PoR proof, or a legacy RSA-PDP proof when enabled."""
         import time
         start = time.time()
         cid_str = manifest.get("cid", {}).get("cid")
+        if isinstance(manifest.get("por"), dict):
+            return self._prove_pairing_por_node(
+                node_id,
+                manifest,
+                sample_count,
+                start,
+            )
+        if self.pairing_por_required:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=(
+                    "This legacy file has no pairing-PoR tags; new uploads are "
+                    "required to enable node challenges."
+                ),
+                cid=cid_str,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
+
         pdp_metadata = manifest.get("pdp")
 
         if not isinstance(pdp_metadata, dict) or pdp_metadata.get("scheme") != StoragePDP.SCHEME:
@@ -677,15 +700,25 @@ class IntegrityVerifier:
                 cid=cid_str,
                 elapsed_ms=(time.time() - start) * 1000,
             )
+        if manifest.get("storage_encrypted") is not True:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=(
+                    "PDP challenges are disabled for files not encrypted before "
+                    "storage; re-upload the file to protect its contents."
+                ),
+                cid=cid_str,
+                elapsed_ms=(time.time() - start) * 1000,
+            )
         if (
             sample_count is not None
             and (
                 not isinstance(sample_count, int)
                 or isinstance(sample_count, bool)
-                or not 1 <= sample_count <= 64
+                or not self.MIN_PDP_SAMPLE_COUNT <= sample_count <= 64
             )
         ):
-            raise ValueError("Sample count must be an integer from 1 to 64.")
+            raise ValueError("PDP sample count must be an integer from 2 to 64.")
 
         node = self.network._get_node(node_id)
         if node is None:
@@ -705,6 +738,7 @@ class IntegrityVerifier:
 
         file_id = cid_str
         total_size = manifest.get("total_size")
+        storage_size = manifest.get("storage_size", total_size)
         sector_size = pdp_metadata.get("sector_size")
         chunk_size = pdp_metadata.get("storage_chunk_size")
         sector_count = pdp_metadata.get("sector_count")
@@ -715,12 +749,15 @@ class IntegrityVerifier:
             or not isinstance(total_size, int)
             or isinstance(total_size, bool)
             or total_size < 0
+            or not isinstance(storage_size, int)
+            or isinstance(storage_size, bool)
+            or storage_size < 0
             or sector_size != StoragePDP.SECTOR_SIZE
             or not isinstance(chunk_size, int)
             or isinstance(chunk_size, bool)
             or chunk_size <= 0
             or chunk_size % sector_size
-            or sector_count != StoragePDP.block_count(total_size)
+            or sector_count != StoragePDP.block_count(storage_size)
             or not isinstance(pdp_metadata.get("n"), str)
             or not re.fullmatch(r"[0-9a-f]{512,1024}", pdp_metadata["n"])
             or not isinstance(pdp_metadata.get("e"), str)
@@ -750,7 +787,7 @@ class IntegrityVerifier:
                 "sector_index": index,
                 "chunk_hash": placement["chunk_hash"],
                 "chunk_offset": data_offset - chunk_index * chunk_size,
-                "length": min(sector_size, max(0, total_size - data_offset)),
+                "length": min(sector_size, max(0, storage_size - data_offset)),
             })
 
         if not eligible:
@@ -759,6 +796,10 @@ class IntegrityVerifier:
                 message=f"Manifest has no PDP sectors assigned to node {node_id}.",
                 cid=cid_str,
                 elapsed_ms=(time.time() - start) * 1000,
+            )
+        if len(eligible) < self.MIN_PDP_SAMPLE_COUNT:
+            raise ValueError(
+                "At least two sectors must be assigned to the node for a PDP challenge."
             )
         if sample_count is None:
             sample_count = min(self.DEFAULT_PDP_SAMPLE_COUNT, len(eligible))
@@ -852,6 +893,222 @@ class IntegrityVerifier:
             elapsed_ms=elapsed,
         )
 
+    def _prove_pairing_por_node(
+        self,
+        node_id: str,
+        manifest: dict,
+        sample_count: int | None,
+        start_time: float,
+    ) -> VerificationResult:
+        """Challenge one node's unique shard and publicly verify its pairing proof."""
+        import time
+
+        cid_str = manifest.get("cid", {}).get("cid")
+        por_metadata = manifest.get("por")
+        erasure_metadata = manifest.get("erasure_coding")
+        if (
+            not isinstance(por_metadata, dict)
+            or por_metadata.get("scheme") != PairingPoR.SCHEME
+            or por_metadata.get("curve") != PairingPoR.CURVE
+            or not isinstance(cid_str, str)
+            or not cid_str
+            or por_metadata.get("file_id") != cid_str
+            or not isinstance(erasure_metadata, dict)
+            or erasure_metadata.get("scheme") != "xor-2-of-3"
+            or erasure_metadata.get("data_shards") != XorErasureCode.DATA_SHARDS
+            or erasure_metadata.get("total_shards") != XorErasureCode.TOTAL_SHARDS
+            or manifest.get("storage_encrypted") is not True
+            or por_metadata.get("sector_size") != XorErasureCode.SECTOR_SIZE
+            or por_metadata.get("field_elements_per_sector")
+            != PairingPoR.FIELD_ELEMENTS_PER_SECTOR
+            or not isinstance(por_metadata.get("sector_count_per_shard"), int)
+            or isinstance(por_metadata.get("sector_count_per_shard"), bool)
+            or por_metadata.get("sector_count_per_shard")
+            < XorErasureCode.MIN_SECTORS_PER_SHARD
+            or not isinstance(por_metadata.get("shard_size"), int)
+            or por_metadata.get("shard_size") != erasure_metadata.get("shard_size")
+            or por_metadata.get("shard_size")
+            != por_metadata.get("sector_count_per_shard") * XorErasureCode.SECTOR_SIZE
+            or not isinstance(por_metadata.get("storage_size"), int)
+            or isinstance(por_metadata.get("storage_size"), bool)
+            or por_metadata.get("storage_size") != manifest.get("storage_size")
+        ):
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message="Manifest contains invalid or unsupported pairing-PoR parameters.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start_time) * 1000,
+            )
+
+        if (
+            sample_count is not None
+            and (
+                not isinstance(sample_count, int)
+                or isinstance(sample_count, bool)
+                or not self.MIN_PDP_SAMPLE_COUNT
+                <= sample_count
+                <= PairingPoR.MAX_CHALLENGE_SECTORS
+            )
+        ):
+            raise ValueError("PoR sample count must be an integer from 2 to 64.")
+
+        node = self.network._get_node(node_id)
+        if node is None:
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=f"Node {node_id} not found in the network.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start_time) * 1000,
+            )
+        if node_id not in self.network.node_urls and not node.is_online:
+            return VerificationResult(
+                status=VerificationStatus.WARNING,
+                message=f"Node {node_id} is offline; cannot complete the PoR challenge.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start_time) * 1000,
+            )
+
+        placements = manifest.get("placements")
+        if not isinstance(placements, list):
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message="Manifest contains invalid PoR shard placements.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start_time) * 1000,
+            )
+        assigned_placements = [
+            item
+            for item in placements
+            if isinstance(item, dict)
+            and isinstance(item.get("shard_index"), int)
+            and not isinstance(item.get("shard_index"), bool)
+            and 0 <= item["shard_index"] < XorErasureCode.TOTAL_SHARDS
+            and item.get("stored_on") == [node_id]
+        ]
+        if (
+            len(assigned_placements) != 1
+            or not isinstance(assigned_placements[0].get("chunk_hash"), str)
+            or not re.fullmatch(
+                r"(?:[0-9a-f]{64}|[0-9a-f]{128})",
+                assigned_placements[0]["chunk_hash"],
+            )
+            or assigned_placements[0].get("chunk_size") != por_metadata["shard_size"]
+        ):
+            return VerificationResult(
+                status=VerificationStatus.ERROR,
+                message=f"Manifest assigns no unique PoR shard to node {node_id}.",
+                cid=cid_str,
+                elapsed_ms=(time.time() - start_time) * 1000,
+            )
+
+        placement = assigned_placements[0]
+        shard_index = placement["shard_index"]
+        sector_count = por_metadata["sector_count_per_shard"]
+        eligible = [
+            {
+                "sector_index": index,
+                "chunk_hash": placement["chunk_hash"],
+                "chunk_offset": index * XorErasureCode.SECTOR_SIZE,
+            }
+            for index in range(sector_count)
+        ]
+        if sample_count is None:
+            sample_count = min(self.DEFAULT_PDP_SAMPLE_COUNT, len(eligible))
+        if sample_count > len(eligible):
+            raise ValueError(
+                f"Sample count {sample_count} exceeds the {len(eligible)} sectors "
+                f"assigned to node {node_id}."
+            )
+
+        nonce = secrets.token_hex(32)
+        selected = secrets.SystemRandom().sample(eligible, sample_count)
+        challenges = [
+            {
+                **sector,
+                "coefficient_hex": format(secrets.randbits(128) or 1, "x"),
+            }
+            for sector in selected
+        ]
+        public_challenges = [
+            {
+                "sector_index": item["sector_index"],
+                "coefficient": int(item["coefficient_hex"], 16),
+            }
+            for item in challenges
+        ]
+        payload = {
+            "file_id": cid_str,
+            "node_id": node_id,
+            "shard_index": shard_index,
+            "nonce_hex": nonce,
+            "sectors": challenges,
+        }
+
+        try:
+            response = self.network.request_por_proof(node_id, payload)
+        except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as error:
+            return VerificationResult(
+                status=VerificationStatus.WARNING,
+                message=f"Could not complete the PoR challenge with node {node_id}: {error}",
+                details={
+                    "node_id": node_id,
+                    "shard_index": shard_index,
+                    "sample_count": sample_count,
+                },
+                cid=cid_str,
+                elapsed_ms=(time.time() - start_time) * 1000,
+            )
+
+        proof_valid = (
+            isinstance(response, dict)
+            and response.get("node_id") == node_id
+            and response.get("shard_index") == shard_index
+            and response.get("nonce_hex") == nonce
+            and isinstance(response.get("sector_count"), int)
+            and not isinstance(response.get("sector_count"), bool)
+            and response.get("sector_count") == sample_count
+            and isinstance(response.get("sigma_hex"), str)
+            and re.fullmatch(r"[0-9a-f]{96}", response["sigma_hex"])
+            and isinstance(response.get("mu_hex"), str)
+            and re.fullmatch(
+                rf"[0-9a-f]{{{64 * PairingPoR.FIELD_ELEMENTS_PER_SECTOR}}}",
+                response["mu_hex"],
+            )
+        )
+        if proof_valid:
+            proof_valid = PairingPoR.verify_aggregate_proof(
+                cid_str,
+                node_id,
+                shard_index,
+                public_challenges,
+                response["sigma_hex"],
+                response["mu_hex"],
+                por_metadata,
+            )
+
+        elapsed = (time.time() - start_time) * 1000
+        status = VerificationStatus.PASSED if proof_valid else VerificationStatus.FAILED
+        return VerificationResult(
+            status=status,
+            message=(
+                f"Pairing-PoR challenge {'PASSED' if proof_valid else 'FAILED'}: "
+                f"Node {node_id} proved possession of shard {shard_index} for "
+                f"{sample_count} sector(s)."
+            ),
+            details={
+                "node_id": node_id,
+                "shard_index": shard_index,
+                "scheme": PairingPoR.SCHEME,
+                "sample_count": sample_count,
+                "sector_indices": [item["sector_index"] for item in challenges],
+                "nonce_hex": nonce,
+                "proof_valid": proof_valid,
+                "data_bytes_returned": 0,
+            },
+            cid=cid_str,
+            elapsed_ms=elapsed,
+        )
+
     # ── 7. Network-wide audit ───────────────────────────────────────
 
     def audit_network(self, manifest: dict) -> VerificationResult:
@@ -873,8 +1130,17 @@ class IntegrityVerifier:
 
         cid_str = manifest["cid"]["cid"]
         expected_replication = manifest["replication_factor"]
+        erasure_metadata = manifest.get("erasure_coding")
+        por_manifest = (
+            isinstance(manifest.get("por"), dict)
+            and manifest["por"].get("scheme") == PairingPoR.SCHEME
+            and isinstance(erasure_metadata, dict)
+            and erasure_metadata.get("scheme") == "xor-2-of-3"
+        )
         issues = []
+        warnings = []
         chunk_health = []
+        healthy_shards = 0
 
         for placement in manifest["placements"]:
             chunk_hash = placement["chunk_hash"]
@@ -893,7 +1159,8 @@ class IntegrityVerifier:
                 data = node.retrieve_chunk(chunk_hash)
                 if data is None:
                     node_statuses.append({"node_id": node_id, "status": "MISSING"})
-                    issues.append(f"Chunk {placement['chunk_index']} missing from {node_id}")
+                    if not por_manifest:
+                        issues.append(f"Chunk {placement['chunk_index']} missing from {node_id}")
                 else:
                     actual_hash = self.engine.hash_bytes(data)
                     if actual_hash == chunk_hash:
@@ -901,15 +1168,21 @@ class IntegrityVerifier:
                         healthy_copies += 1
                     else:
                         node_statuses.append({"node_id": node_id, "status": "CORRUPTED"})
-                        issues.append(f"Chunk {placement['chunk_index']} corrupted on {node_id}")
+                        if not por_manifest:
+                            issues.append(
+                                f"Chunk {placement['chunk_index']} corrupted on {node_id}"
+                            )
 
             if healthy_copies == 0:
-                issues.append(f"Chunk {placement['chunk_index']} has NO healthy copies!")
+                if not por_manifest:
+                    issues.append(f"Chunk {placement['chunk_index']} has NO healthy copies!")
             elif healthy_copies < expected_replication:
                 issues.append(
                     f"Chunk {placement['chunk_index']} under-replicated: "
                     f"{healthy_copies}/{expected_replication}"
                 )
+            else:
+                healthy_shards += 1
 
             chunk_health.append({
                 "chunk_index": placement["chunk_index"],
@@ -919,19 +1192,51 @@ class IntegrityVerifier:
                 "nodes": node_statuses,
             })
 
+        if por_manifest:
+            if healthy_shards < XorErasureCode.DATA_SHARDS:
+                issues.append(
+                    f"Only {healthy_shards} of {XorErasureCode.TOTAL_SHARDS} coded "
+                    "shards are healthy; the file is not recoverable."
+                )
+            elif healthy_shards < XorErasureCode.TOTAL_SHARDS:
+                warnings.append(
+                    f"Only {healthy_shards} of {XorErasureCode.TOTAL_SHARDS} coded "
+                    "shards are healthy; the file remains recoverable but has reduced redundancy."
+                )
+
         # Verify Merkle root and file hash
         file_result = self.verify_file_integrity(manifest)
 
         elapsed = (time.time() - start) * 1000
 
-        if not issues and file_result.passed:
+        if not issues and file_result.passed and warnings:
             return VerificationResult(
-                status=VerificationStatus.PASSED,
-                message="Full network audit PASSED: all data verified, replication healthy.",
+                status=VerificationStatus.WARNING,
+                message="The PoR file is recoverable, but its erasure redundancy is degraded.",
                 details={
                     "chunk_health": chunk_health,
                     "file_verification": file_result.to_dict(),
                     "issues": [],
+                    "warnings": warnings,
+                    "healthy_shards": healthy_shards,
+                    "required_shards": XorErasureCode.DATA_SHARDS,
+                },
+                cid=cid_str,
+                elapsed_ms=elapsed,
+            )
+        if not issues and file_result.passed:
+            return VerificationResult(
+                status=VerificationStatus.PASSED,
+                message=(
+                    "Full PoR network audit PASSED: all shards are healthy."
+                    if por_manifest
+                    else "Full network audit PASSED: all data verified, replication healthy."
+                ),
+                details={
+                    "chunk_health": chunk_health,
+                    "file_verification": file_result.to_dict(),
+                    "issues": [],
+                    "warnings": warnings,
                 },
                 cid=cid_str,
                 elapsed_ms=elapsed,
@@ -944,6 +1249,7 @@ class IntegrityVerifier:
                     "chunk_health": chunk_health,
                     "file_verification": file_result.to_dict(),
                     "issues": issues,
+                    "warnings": warnings,
                 },
                 cid=cid_str,
                 elapsed_ms=elapsed,

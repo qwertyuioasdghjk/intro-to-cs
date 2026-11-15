@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .pdp import StoragePDP
+from .por import PairingPoR
+from .erasure import XorErasureCode
 
 
 class StorageNode:
@@ -216,6 +218,143 @@ class StorageNode:
             chunk_metadata.pop("pdp_tags", None)
         self._save_metadata()
 
+    def store_por_tag(
+        self,
+        chunk_hash: str,
+        file_id: str,
+        node_id: str,
+        shard_index: int,
+        sector_index: int,
+        tag: str,
+    ) -> bool:
+        """Persist a pairing authenticator bound to this node and shard."""
+        if node_id != self.node_id or not self.has_chunk(chunk_hash):
+            return False
+
+        por_tags = self._metadata[chunk_hash].setdefault("por_tags", {})
+        file_tags = por_tags.setdefault(file_id, {})
+        node_tags = file_tags.setdefault(node_id, {})
+        shard_tags = node_tags.setdefault(str(shard_index), {})
+        index = str(sector_index)
+        existing = shard_tags.get(index)
+        if existing is not None:
+            if existing != tag:
+                raise ValueError("Conflicting PoR tag already stored for this sector.")
+            return False
+
+        shard_tags[index] = tag
+        self._save_metadata()
+        return True
+
+    def remove_por_tag(
+        self,
+        chunk_hash: str,
+        file_id: str,
+        node_id: str,
+        shard_index: int,
+        sector_index: int,
+    ):
+        """Remove a newly added PoR tag when a storage operation rolls back."""
+        chunk_metadata = self._metadata.get(chunk_hash)
+        if chunk_metadata is None:
+            return
+
+        por_tags = chunk_metadata.get("por_tags", {})
+        file_tags = por_tags.get(file_id, {})
+        node_tags = file_tags.get(node_id, {})
+        shard_tags = node_tags.get(str(shard_index), {})
+        shard_tags.pop(str(sector_index), None)
+        if not shard_tags:
+            node_tags.pop(str(shard_index), None)
+        if not node_tags:
+            file_tags.pop(node_id, None)
+        if not file_tags:
+            por_tags.pop(file_id, None)
+        if not por_tags:
+            chunk_metadata.pop("por_tags", None)
+        self._save_metadata()
+
+    def respond_to_por_challenge(self, payload: dict) -> Optional[dict]:
+        """Return a compact pairing-PoR response for this node's assigned shard."""
+        if not self.is_online:
+            return None
+
+        file_id = payload.get("file_id")
+        node_id = payload.get("node_id")
+        shard_index = payload.get("shard_index")
+        nonce_hex = payload.get("nonce_hex")
+        sectors = payload.get("sectors")
+        if (
+            not isinstance(file_id, str)
+            or not file_id
+            or node_id != self.node_id
+            or not isinstance(shard_index, int)
+            or isinstance(shard_index, bool)
+            or not 0 <= shard_index < XorErasureCode.TOTAL_SHARDS
+            or not isinstance(nonce_hex, str)
+            or not isinstance(sectors, list)
+            or not 2 <= len(sectors) <= PairingPoR.MAX_CHALLENGE_SECTORS
+        ):
+            raise ValueError("Invalid pairing-PoR challenge.")
+
+        response_sectors = []
+        seen_indices = set()
+        for item in sectors:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid pairing-PoR challenge sector.")
+            sector_index = item.get("sector_index")
+            chunk_hash = item.get("chunk_hash")
+            chunk_offset = item.get("chunk_offset")
+            coefficient_hex = item.get("coefficient_hex")
+            if (
+                not isinstance(sector_index, int)
+                or isinstance(sector_index, bool)
+                or sector_index < 0
+                or sector_index in seen_indices
+                or not isinstance(chunk_hash, str)
+                or not isinstance(chunk_offset, int)
+                or isinstance(chunk_offset, bool)
+                or chunk_offset != sector_index * XorErasureCode.SECTOR_SIZE
+                or not isinstance(coefficient_hex, str)
+                or not 1 <= len(coefficient_hex) <= 64
+            ):
+                raise ValueError("Invalid pairing-PoR challenge sector.")
+            try:
+                coefficient = int(coefficient_hex, 16)
+            except ValueError as error:
+                raise ValueError("Invalid pairing-PoR coefficient.") from error
+            seen_indices.add(sector_index)
+
+            chunk_data = self.retrieve_chunk(chunk_hash)
+            tag = (
+                self._metadata.get(chunk_hash, {})
+                .get("por_tags", {})
+                .get(file_id, {})
+                .get(node_id, {})
+                .get(str(shard_index), {})
+                .get(str(sector_index))
+            )
+            if (
+                chunk_data is None
+                or tag is None
+                or chunk_offset + XorErasureCode.SECTOR_SIZE > len(chunk_data)
+            ):
+                return None
+            sector_data = chunk_data[
+                chunk_offset:chunk_offset + XorErasureCode.SECTOR_SIZE
+            ]
+            response_sectors.append((tag, sector_data, coefficient))
+
+        sigma_hex, mu_hex = PairingPoR.aggregate_response(response_sectors)
+        return {
+            "node_id": node_id,
+            "shard_index": shard_index,
+            "nonce_hex": nonce_hex,
+            "sector_count": len(sectors),
+            "sigma_hex": sigma_hex,
+            "mu_hex": mu_hex,
+        }
+
     def respond_to_pdp_challenge(self, payload: dict) -> Optional[dict]:
         """Return a compact RSA-PDP aggregate proof without returning sector bytes."""
         if not self.is_online:
@@ -225,8 +364,8 @@ class StorageNode:
         nonce_hex = payload["nonce_hex"]
         modulus = int(payload["n"], 16)
         sectors = payload["sectors"]
-        if not isinstance(sectors, list) or not 1 <= len(sectors) <= 64:
-            raise ValueError("A PDP challenge must include between 1 and 64 sectors.")
+        if not isinstance(sectors, list) or not 2 <= len(sectors) <= 64:
+            raise ValueError("A PDP challenge must include between 2 and 64 sectors.")
 
         sigma = 1
         mu = 0

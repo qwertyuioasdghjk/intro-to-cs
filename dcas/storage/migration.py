@@ -1,6 +1,7 @@
 """One-time migration of legacy shared-space files to encrypted node storage."""
 
 from .encryption import StorageEncryptionError, StorageEncryptor
+from .por import PairingPoR
 
 
 def migrate_shared_storage(components: dict) -> dict[str, int]:
@@ -33,8 +34,17 @@ def migrate_shared_storage(components: dict) -> dict[str, int]:
                     "storage key or investigate corruption before retrying."
                 ) from error
             source_fingerprint = encryptor.fingerprint(client_payload)
+            changed = False
             if manifest.get("source_fingerprint") != source_fingerprint:
                 manifest["source_fingerprint"] = source_fingerprint
+                changed = True
+            if (
+                not isinstance(manifest.get("por"), dict)
+                or manifest["por"].get("scheme") != PairingPoR.SCHEME
+            ):
+                manifest["por_status"] = "legacy"
+                changed = True
+            if changed:
                 if not metadata.update_shared_manifest(cid, manifest):
                     raise RuntimeError(f"Shared file {cid} changed during migration.")
             already_encrypted += 1
@@ -55,6 +65,11 @@ def migrate_shared_storage(components: dict) -> dict[str, int]:
             if is_wrapped:
                 manifest["storage_encrypted"] = True
                 manifest["source_fingerprint"] = encryptor.fingerprint(client_payload)
+                if (
+                    not isinstance(manifest.get("por"), dict)
+                    or manifest["por"].get("scheme") != PairingPoR.SCHEME
+                ):
+                    manifest["por_status"] = "legacy"
                 if not metadata.update_shared_manifest(cid, manifest):
                     raise RuntimeError(f"Shared file {cid} changed during migration.")
                 already_encrypted += 1
@@ -72,6 +87,11 @@ def migrate_shared_storage(components: dict) -> dict[str, int]:
                 replacement["cid_hash_is_client_content"] = True
                 replacement["source_fingerprint"] = encryptor.fingerprint(client_payload)
                 replacement["storage_migration_old_chunks"] = old_chunk_hashes
+                if (
+                    not isinstance(replacement.get("por"), dict)
+                    or replacement["por"].get("scheme") != PairingPoR.SCHEME
+                ):
+                    replacement["por_status"] = "legacy"
 
                 if not metadata.update_shared_manifest(cid, replacement):
                     referenced = _referenced_chunks(metadata)

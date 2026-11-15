@@ -188,7 +188,7 @@ class StoragePDP:
             or mu < 0
             or mu.bit_length() > 1182
             or not isinstance(challenges, list)
-            or not 1 <= len(challenges) <= 64
+            or not 2 <= len(challenges) <= 64
         ):
             return False
 

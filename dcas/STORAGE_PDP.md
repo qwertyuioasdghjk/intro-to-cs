@@ -1,60 +1,84 @@
-# Educational RSA proof of data possession
+# Educational pairing-based proof of retrievability
 
-The API's `POST /api/verify/<cid>/nodes/<node_id>` endpoint runs the
-`dcas-rsa-pdp-edu-v1` audit. At upload time, the API splits the stored bytes
-into 128-byte sectors and creates an RSA homomorphic authenticator for each
-sector. A node challenge selects random sectors and coefficients. The node
-returns an aggregate authenticator and an aggregate sector value, not the
-sector bytes. The verifier checks the aggregate with the public parameters
-saved in the manifest.
+New regular API uploads use the experimental `dcas-pairing-por-2of3-edu-v1`
+construction. The API encrypts the stored bytes with AES-256-GCM, applies a
+2-of-3 XOR code to those ciphertext bytes, and places the three distinct shards
+on three distinct nodes. Any two valid shards reconstruct the encrypted file.
+Legacy manifests are not silently upgraded; the API rejects node PoR challenges
+for manifests without the new `por` parameters. New manifests set
+`por_status: "active"`; migration tooling marks upgraded-but-untagged manifests
+as `por_status: "legacy"`. Older manifests without that field are still
+recognized as legacy from the missing `por` parameters.
 
-For file identifier `name`, sector `i`, sector value `m_i`, and RSA parameters
-`(N, e, d)`, the educational tag is:
+## Tags and proof verification
 
-```text
-sigma_i = (H(name || i) * u^m_i)^d mod N
-```
-
-For random challenge coefficients `v_i`, the node responds with:
-
-```text
-sigma = product(sigma_i^v_i) mod N
-mu = sum(v_i * m_i)
-```
-
-The verifier checks:
+Each coded shard is divided into 124-byte sectors, each containing four
+31-byte field elements. A sector tag is bound to the file, the expected node,
+the shard index, and the sector index. In the BLS12-381 groups, the educational
+tag is:
 
 ```text
-sigma^e = product(H(name || i)^v_i) * u^mu mod N
+sigma[i] = x * (H(file || node || shard || i) + sum(u[j] * m[i,j]))
 ```
 
-This tests possession of the sampled sectors without transmitting those sector
-bytes during the audit. It is an educational PDP construction, **not a
-production-audited protocol or a formal proof of retrievability**. The Python
-implementation performs private RSA exponentiation itself and is not designed
-to resist side-channel attacks. It also does not prove that copies are
-independent, prevent a node from fetching data from a colluding peer, or
-guarantee future retention, or provide privacy against an auditor who collects
-many aggregate responses. Tag generation is computationally expensive in this
-educational Python implementation, especially for large files. Use a reviewed
-PDP/PoR implementation for production storage.
+For random nonzero challenge coefficients `c[i]`, the node returns only:
 
-## Key and compatibility
+```text
+sigma = sum(c[i] * sigma[i])
+mu[j] = sum(c[i] * m[i,j]) mod r
+```
 
-The API creates an RSA-2048 private key at
-`.dcas-pdp-private-key.pem` inside the configured network directory. Set
-`DCAS_PDP_PRIVATE_KEY_FILE` to use another path. Protect and back up this key
-with appropriate filesystem ACLs. The key is unencrypted on disk; do not expose
-it to storage-node operators or commit it to source control. Losing it prevents
-using the same key for future tags; existing manifests retain the public
-parameters needed to verify already-stored tags. The app can generate a
-replacement key, but back up the original to preserve key continuity.
+The verifier checks the aggregate pairing equation:
 
-Files uploaded before PDP tagging was enabled have no sector authenticators.
-Upload those files again to write PDP tags and update their manifests. The
-node-side endpoint is `POST /v1/pdp/challenge`; it is read-only and requires the
-node to have the chunk data and PDP tags produced at upload.
+```text
+e(sigma, G2) = e(
+    sum(c[i] * H(file || node || shard || i)) + sum(mu[j] * U[j]),
+    public_key
+)
+```
 
-The API accepts `sample_count` from 1 to 64. It counts challenged 128-byte
-sectors, not file chunks. A challenge fails if the requested number exceeds
-the number of sectors assigned to that node.
+The challenge API rejects fewer than two sectors. The verifier checks the
+response nonce, node ID, shard index, and pairing proof; sector data is not
+returned during an audit. Including node and shard identities in the tag
+prevents reusing a proof created for a different identity. It cannot stop
+colluding nodes from relaying challenges or pooling their data.
+
+Audits remain probabilistic. If `n` sectors contain `b` corrupted sectors and
+the verifier samples `c` distinct sectors uniformly, the probability of missing
+that corruption is `choose(n-b, c) / choose(n, c)`. PoR does not make every
+small corruption detectable in every audit. The 2-of-3 code instead provides
+recovery from any one missing or hash-detectably corrupted shard; a full
+retrieval also checks each candidate shard against its committed hash.
+
+## Prototype limits and key handling
+
+This is an educational reference prototype, not a production storage protocol.
+The `py-ecc` dependency explicitly warns that its experimental code has not been
+audited. The XOR erasure code is intentionally simple, and the pure-Python
+pairing and per-sector tag generation are computationally expensive. Do not
+use this implementation for valuable or adversarial production data.
+
+The API requires at least three nodes for new PoR uploads. Each shard is stored
+on one node, regardless of the legacy replication-factor setting. The API and
+node sidecars must share the same node-service bearer token when using remote
+nodes; remote URLs must use HTTPS, while HTTP is allowed only on loopback.
+Keep node services private.
+
+The API creates a PoR private key at `.dcas-por-private-key.hex` inside the
+configured network directory. Set `DCAS_POR_PRIVATE_KEY_FILE` to use another
+path. Protect and back up this key; the manifest contains public verification
+parameters, but losing the private key prevents consistent future tagging.
+Never commit the key to source control.
+
+The PoR tagger covers the API's encrypted storage envelope, not plaintext
+uploads. The API still receives normal uploads in plaintext and holds the
+storage encryption key; this is storage-layer encryption, not end-to-end
+encryption against the API operator. See
+[STORAGE_ENCRYPTION.md](./STORAGE_ENCRYPTION.md) for key and compatibility
+details.
+
+The node-side proof endpoint is `POST /v1/por/challenge`. The public API route
+is `POST /api/verify/<cid>/nodes/<node_id>` and accepts `sample_count` from 2
+through 64. Existing manifests without PoR tags are legacy and must be
+re-uploaded to receive the new protection; encryption migration alone does not
+retroactively add PoR tags.

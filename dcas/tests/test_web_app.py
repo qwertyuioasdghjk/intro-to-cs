@@ -17,7 +17,7 @@ class TestWebApp(unittest.TestCase):
         self.app = create_app(
             network_dir=os.path.join(self.test_dir, "network"),
             db_path=os.path.join(self.test_dir, "metadata.db"),
-            num_nodes=2,
+            num_nodes=3,
             replication_factor=1,
             mongodb_uri="",
         )
@@ -81,11 +81,66 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(upload.status_code, 201)
 
         cid = upload.get_json()["cid"]
+        manifest = self.app.extensions["dcas"]["metadata"].get_manifest(cid)
+        stored = self.app.extensions["dcas"]["network"].retrieve_file(manifest)
+        self.assertNotEqual(stored, b"")
+        self.assertTrue(manifest["storage_encrypted"])
         verification = self.client.post(f"/api/verify/{cid}")
         self.assertEqual(verification.get_json()["status"], "PASSED")
+        download = self.client.get(f"/api/download/{cid}")
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download.data, b"")
 
         invalid = self.client.post("/api/upload/text", json={"content": 123})
         self.assertEqual(invalid.status_code, 400)
+
+    def test_public_file_upload_is_encrypted_in_storage_and_decrypted_on_download(self):
+        source = b"private upload contents " * 40
+        uploaded = self.client.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(source), "encrypted.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(uploaded.status_code, 201)
+
+        cid = uploaded.get_json()["cid"]
+        manifest = self.app.extensions["dcas"]["metadata"].get_manifest(cid)
+        stored = self.app.extensions["dcas"]["network"].retrieve_file(manifest)
+        self.assertTrue(manifest["storage_encrypted"])
+        self.assertEqual(
+            cid,
+            self.app.extensions["dcas"]["network"].cid_generator.generate(
+                source
+            ).cid_string,
+        )
+        self.assertEqual(manifest["total_size"], len(source))
+        self.assertEqual(manifest["storage_size"], len(stored))
+        self.assertNotEqual(stored, source)
+        self.assertTrue(stored.startswith(b"DCAS-STORE-1:"))
+
+        checked = self.client.post(f"/api/verify/{cid}")
+        self.assertEqual(checked.get_json()["status"], "PASSED")
+        downloaded = self.client.get(f"/api/download/{cid}")
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertEqual(downloaded.data, source)
+
+        network = self.app.extensions["dcas"]["network"]
+        counts_before_duplicate = [node.chunk_count for node in network.nodes]
+        duplicate = self.client.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(source), "renamed.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(duplicate.status_code, 201)
+        self.assertEqual(duplicate.get_json()["cid"], cid)
+        self.assertEqual(
+            [node.chunk_count for node in network.nodes],
+            counts_before_duplicate,
+        )
+        self.assertEqual(
+            self.app.extensions["dcas"]["metadata"].get_manifest(cid)["filename"],
+            "renamed.txt",
+        )
 
     def test_text_upload_reports_unavailable_storage(self):
         for node in self.app.extensions["dcas"]["network"].nodes:
@@ -108,37 +163,60 @@ class TestWebApp(unittest.TestCase):
         recovered = self.client.post(f"/api/network/recover/{node_id}")
         self.assertEqual(recovered.status_code, 200)
         status_after_recovery = self.client.get("/api/network/status").get_json()
-        self.assertEqual(status_after_recovery["online_nodes"], 2)
+        self.assertEqual(status_after_recovery["online_nodes"], 3)
 
-    def test_api_checks_rsa_pdp_node_possession(self):
+    def test_api_checks_pairing_por_node_possession(self):
         uploaded = self.client.post(
             "/api/upload",
-            data={"file": (io.BytesIO(b"node retrievability API"), "sample.txt")},
+            data={"file": (io.BytesIO(b"node retrievability API " * 24), "sample.txt")},
             content_type="multipart/form-data",
         )
         self.assertEqual(uploaded.status_code, 201)
         cid = uploaded.get_json()["cid"]
         manifest = self.app.extensions["dcas"]["metadata"].get_manifest(cid)
+        self.assertEqual(manifest["por_status"], "active")
         node_id = manifest["placements"][0]["stored_on"][0]
 
         checked = self.client.post(
             f"/api/verify/{cid}/nodes/{node_id}",
-            json={"sample_count": 1},
+            json={"sample_count": 2},
         )
         self.assertEqual(checked.status_code, 200)
         self.assertEqual(checked.get_json()["status"], "PASSED")
-        self.assertEqual(checked.get_json()["details"]["sample_count"], 1)
+        self.assertEqual(checked.get_json()["details"]["sample_count"], 2)
         self.assertEqual(checked.get_json()["details"]["data_bytes_returned"], 0)
         self.assertEqual(
             checked.get_json()["details"]["scheme"],
-            "dcas-rsa-pdp-edu-v1",
+            "dcas-pairing-por-2of3-edu-v1",
         )
 
         invalid = self.client.post(
             f"/api/verify/{cid}/nodes/{node_id}",
-            json={"sample_count": 0},
+            json={"sample_count": 1},
         )
         self.assertEqual(invalid.status_code, 400)
+
+        small_upload = self.client.post(
+            "/api/upload",
+            data={"file": (io.BytesIO(b"one sector"), "small.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(small_upload.status_code, 201)
+        small_cid = small_upload.get_json()["cid"]
+        small_node_id = self.app.extensions["dcas"]["metadata"].get_manifest(
+            small_cid
+        )["placements"][0]["stored_on"][0]
+        one_sector_request = self.client.post(
+            f"/api/verify/{small_cid}/nodes/{small_node_id}",
+            json={"sample_count": 1},
+        )
+        self.assertEqual(one_sector_request.status_code, 400)
+
+        small_default = self.client.post(
+            f"/api/verify/{small_cid}/nodes/{small_node_id}",
+        )
+        self.assertEqual(small_default.status_code, 200)
+        self.assertEqual(small_default.get_json()["status"], "PASSED")
 
     def test_shared_space_is_encrypted_and_access_is_revocable(self):
         self.assertEqual(self.client.get("/share/example").status_code, 200)
@@ -303,6 +381,7 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(migrated_manifest["cid"]["cid"], legacy_cid)
         self.assertTrue(migrated_manifest["cid_hash_is_client_content"])
         self.assertTrue(migrated_manifest["storage_encrypted"])
+        self.assertEqual(migrated_manifest["por_status"], "legacy")
         self.assertEqual(encryptor.decrypt(migrated_bytes), client_payload)
         self.assertTrue(metadata.has_shared_source_fingerprint(encryptor.fingerprint(client_payload)))
         self.assertTrue(
@@ -352,7 +431,7 @@ class TestWebApp(unittest.TestCase):
 
         self.assertEqual(components["metadata"].get_manifest(cid), manifest)
 
-    def test_delete_file_removes_unshared_chunks_and_keeps_shared_chunks(self):
+    def test_delete_file_does_not_remove_another_encrypted_files_chunks(self):
         shared_chunk = b"S" * (256 * 1024)
         first_upload = self.client.post(
             "/api/upload",
@@ -372,8 +451,11 @@ class TestWebApp(unittest.TestCase):
         metadata = self.app.extensions["dcas"]["metadata"]
         network = self.app.extensions["dcas"]["network"]
         first_manifest = metadata.get_manifest(first_cid)
+        second_manifest = metadata.get_manifest(second_cid)
         shared_hash = first_manifest["placements"][0]["chunk_hash"]
         unique_hash = first_manifest["placements"][1]["chunk_hash"]
+        second_shared_hash = second_manifest["placements"][0]["chunk_hash"]
+        self.assertNotEqual(shared_hash, second_shared_hash)
 
         response = self.client.delete(f"/api/file/{first_cid}")
         self.assertEqual(response.status_code, 200)
@@ -381,8 +463,11 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/file/{first_cid}").status_code, 404)
         self.assertEqual(self.client.get(f"/api/file/{second_cid}").status_code, 200)
         self.assertIsNotNone(network.retrieve_file(metadata.get_manifest(second_cid)))
-        self.assertTrue(any(node.has_chunk(shared_hash) for node in network.nodes))
+        self.assertFalse(any(node.has_chunk(shared_hash) for node in network.nodes))
         self.assertFalse(any(node.has_chunk(unique_hash) for node in network.nodes))
+        self.assertTrue(
+            any(node.has_chunk(second_shared_hash) for node in network.nodes)
+        )
 
     def test_mongodb_environment_selects_mongodb_metadata_store(self):
         test_dir = tempfile.mkdtemp()
@@ -400,7 +485,7 @@ class TestWebApp(unittest.TestCase):
                 app = create_app(
                     network_dir=os.path.join(test_dir, "network"),
                     db_path=os.path.join(test_dir, "metadata.db"),
-                    num_nodes=2,
+                    num_nodes=3,
                     replication_factor=1,
                 )
 

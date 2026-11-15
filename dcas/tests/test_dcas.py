@@ -27,8 +27,13 @@ from dcas.storage.node import StorageNode
 from dcas.storage.network import StorageNetwork
 from dcas.storage.node_server import create_node_app
 from dcas.storage.pdp import StoragePDP
+from dcas.storage.encryption import StorageEncryptor
+from dcas.storage.erasure import XorErasureCode
+from dcas.storage.por import PairingPoR
 from dcas.verifier.verifier import IntegrityVerifier, VerificationStatus
 from dcas.database.metadata import MetadataStore
+
+NODE_AUTH_TOKEN = "test-node-auth-token-that-is-at-least-32-chars"
 
 
 class TestHashEngine(unittest.TestCase):
@@ -510,22 +515,48 @@ class TestIntegrityVerifier(unittest.TestCase):
         node = self.network._get_node(node_id)
         self.assertIsNotNone(node)
 
-        node_client = create_node_app(node_id, node.storage_dir).test_client()
-        self.assertEqual(node_client.get("/v1/chunks/not-a-hash").status_code, 400)
-        self.assertEqual(node_client.get(f"/v1/chunks/{'0' * 64}").status_code, 404)
+        node_client = create_node_app(
+            node_id,
+            node.storage_dir,
+            auth_token=NODE_AUTH_TOKEN,
+        ).test_client()
+        node_headers = {"Authorization": f"Bearer {NODE_AUTH_TOKEN}"}
+        self.assertEqual(node_client.get("/v1/chunks/not-a-hash").status_code, 401)
+        self.assertEqual(
+            node_client.get(
+                "/v1/chunks/not-a-hash",
+                headers=node_headers,
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            node_client.get(
+                f"/v1/chunks/{'0' * 64}",
+                headers=node_headers,
+            ).status_code,
+            404,
+        )
 
         class InMemoryNodeHTTP:
             def open(opener, request, timeout):
                 self.assertEqual(request.method, "GET")
                 self.assertEqual(timeout, 5)
-                response = node_client.get(urlsplit(request.full_url).path)
+                self.assertEqual(
+                    request.get_header("Authorization"),
+                    f"Bearer {NODE_AUTH_TOKEN}",
+                )
+                response = node_client.get(
+                    urlsplit(request.full_url).path,
+                    headers={"Authorization": request.get_header("Authorization")},
+                )
                 if response.status_code == 404:
                     raise HTTPError(request.full_url, 404, "Not found", {}, None)
                 if response.status_code != 200:
                     raise AssertionError(f"Node service returned {response.status_code}")
                 return io.BytesIO(response.data)
 
-        self.network.node_urls[node_id] = "http://node-service.test"
+        self.network.node_auth_token = NODE_AUTH_TOKEN
+        self.network.node_urls[node_id] = "https://node-service.test"
         with patch("dcas.storage.network.build_opener", return_value=InMemoryNodeHTTP()):
             result = self.verifier.check_node_retrievability(node_id, manifest)
 
@@ -595,16 +626,25 @@ class TestIntegrityVerifier(unittest.TestCase):
         manifest = self.network.store_bytes(b"Remote Merkle challenge " * 30000)
         node_id = manifest["placements"][0]["stored_on"][0]
         node = self.network._get_node(node_id)
-        node_client = create_node_app(node_id, node.storage_dir).test_client()
+        node_client = create_node_app(
+            node_id,
+            node.storage_dir,
+            auth_token=NODE_AUTH_TOKEN,
+        ).test_client()
 
         class InMemoryNodeHTTP:
             def open(inner_self, request, timeout):
                 self.assertEqual(request.method, "POST")
                 self.assertEqual(timeout, 5)
+                self.assertEqual(
+                    request.get_header("Authorization"),
+                    f"Bearer {NODE_AUTH_TOKEN}",
+                )
                 response = node_client.post(
                     urlsplit(request.full_url).path,
                     data=request.data,
                     content_type="application/json",
+                    headers={"Authorization": request.get_header("Authorization")},
                 )
                 if response.status_code == 404:
                     raise HTTPError(request.full_url, 404, "Not found", {}, None)
@@ -612,7 +652,8 @@ class TestIntegrityVerifier(unittest.TestCase):
                     raise AssertionError(f"Node service returned {response.status_code}")
                 return io.BytesIO(response.data)
 
-        self.network.node_urls[node_id] = "http://node-service.test"
+        self.network.node_auth_token = NODE_AUTH_TOKEN
+        self.network.node_urls[node_id] = "https://node-service.test"
         with patch("dcas.storage.network.build_opener", return_value=InMemoryNodeHTTP()):
             result = self.verifier.challenge_node(node_id, manifest)
 
@@ -633,26 +674,124 @@ class TestIntegrityVerifier(unittest.TestCase):
         self.assertEqual(result.status, VerificationStatus.FAILED)
 
 
+class TestStorageNodeServiceAuth(unittest.TestCase):
+    """Node HTTP endpoints require a configured shared bearer secret."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.node = StorageNode("node-auth", self.test_dir)
+        self.chunk_data = b"private stored chunk"
+        self.chunk_hash = HashEngine().hash_bytes(self.chunk_data)
+        self.node.store_chunk(self.chunk_hash, self.chunk_data)
+        self.client = create_node_app(
+            self.node.node_id,
+            self.test_dir,
+            auth_token=NODE_AUTH_TOKEN,
+        ).test_client()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_all_node_endpoints_reject_missing_or_invalid_authentication(self):
+        chunk_url = f"/v1/chunks/{self.chunk_hash}"
+        self.assertEqual(self.client.get(chunk_url).status_code, 401)
+        self.assertEqual(
+            self.client.get(
+                chunk_url,
+                headers={"Authorization": "Bearer invalid-token"},
+            ).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post("/v1/pdp/challenge", json={}).status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post("/v1/por/challenge", json={}).status_code,
+            401,
+        )
+
+        authorized = self.client.get(
+            chunk_url,
+            headers={"Authorization": f"Bearer {NODE_AUTH_TOKEN}"},
+        )
+        self.assertEqual(authorized.status_code, 200)
+        self.assertEqual(authorized.data, self.chunk_data)
+
+    def test_node_service_requires_a_strong_token_and_blocks_single_sector(self):
+        with self.assertRaisesRegex(ValueError, "DCAS_NODE_AUTH_TOKEN"):
+            create_node_app(self.node.node_id, self.test_dir, auth_token="short")
+
+        authorized = {"Authorization": f"Bearer {NODE_AUTH_TOKEN}"}
+        response = self.client.post(
+            "/v1/pdp/challenge",
+            json={
+                "file_id": "file",
+                "nonce_hex": "00" * 32,
+                "n": "f" * 512,
+                "sectors": [{}],
+            },
+            headers=authorized,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("between 2 and 64", response.get_json()["error"])
+        por_response = self.client.post(
+            "/v1/por/challenge",
+            json={
+                "file_id": "file",
+                "node_id": self.node.node_id,
+                "shard_index": 0,
+                "nonce_hex": "00" * 32,
+                "sectors": [{}],
+            },
+            headers=authorized,
+        )
+        self.assertEqual(por_response.status_code, 400)
+        self.assertIn("between 2 and 64", por_response.get_json()["error"])
+
+    def test_remote_node_requires_authentication_and_secure_transport(self):
+        with self.assertRaisesRegex(ValueError, "DCAS_NODE_AUTH_TOKEN"):
+            StorageNetwork(
+                base_dir=os.path.join(self.test_dir, "no-token"),
+                node_urls={"node-000": "https://node.example"},
+            )
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            StorageNetwork(
+                base_dir=os.path.join(self.test_dir, "insecure"),
+                node_urls={"node-000": "http://node.example"},
+                node_auth_token=NODE_AUTH_TOKEN,
+            )
+
+
 class TestStoragePDP(unittest.TestCase):
     """Tests for the educational RSA proof-of-data-possession protocol."""
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.pdp = StoragePDP.from_config(self.test_dir)
+        self.encryptor = StorageEncryptor.from_config(self.test_dir)
         self.network = StorageNetwork(
             base_dir=os.path.join(self.test_dir, "network"),
             num_nodes=3,
             replication_factor=2,
             pdp=self.pdp,
         )
-        self.verifier = IntegrityVerifier(self.network)
+        self.verifier = IntegrityVerifier(
+            self.network,
+            storage_encryptor=self.encryptor,
+        )
+
+    def store_encrypted(self, data: bytes) -> dict:
+        manifest = self.network.store_bytes(self.encryptor.encrypt(data))
+        manifest["storage_encrypted"] = True
+        return manifest
 
     def tearDown(self):
         shutil.rmtree(self.test_dir)
 
     def test_pdp_verifies_aggregate_without_returning_file_blocks(self):
         data = bytes(range(256)) * 2
-        manifest = self.network.store_bytes(data)
+        manifest = self.store_encrypted(data)
         node_id = manifest["placements"][0]["stored_on"][0]
 
         result = self.verifier.prove_node_possession(node_id, manifest, sample_count=2)
@@ -663,17 +802,19 @@ class TestStoragePDP(unittest.TestCase):
         self.assertEqual(result.details["scheme"], StoragePDP.SCHEME)
 
     def test_pdp_handles_empty_files_and_repeated_uploads(self):
-        manifest = self.network.store_bytes(b"")
-        repeated_manifest = self.network.store_bytes(b"")
+        encrypted_empty = self.encryptor.encrypt(b"")
+        manifest = self.network.store_bytes(encrypted_empty)
+        repeated_manifest = self.network.store_bytes(encrypted_empty)
+        manifest["storage_encrypted"] = True
+        repeated_manifest["storage_encrypted"] = True
         node_id = repeated_manifest["placements"][0]["stored_on"][0]
 
-        result = self.verifier.prove_node_possession(node_id, repeated_manifest)
-
         self.assertEqual(manifest["cid"]["cid"], repeated_manifest["cid"]["cid"])
-        self.assertEqual(result.status, VerificationStatus.PASSED)
+        with self.assertRaisesRegex(ValueError, "At least two sectors"):
+            self.verifier.prove_node_possession(node_id, repeated_manifest)
 
     def test_pdp_rejects_tampered_authenticator(self):
-        manifest = self.network.store_bytes(b"Tamper PDP authenticator " * 20)
+        manifest = self.store_encrypted(b"Tamper PDP authenticator " * 20)
         node_id = manifest["placements"][0]["stored_on"][0]
         for placement in manifest["placements"]:
             if node_id not in placement["stored_on"]:
@@ -698,7 +839,10 @@ class TestStoragePDP(unittest.TestCase):
             num_nodes=2,
             replication_factor=1,
         )
-        manifest = legacy_network.store_bytes(b"Legacy file without PDP tags")
+        manifest = legacy_network.store_bytes(
+            self.encryptor.encrypt(b"Legacy file without PDP tags")
+        )
+        manifest["storage_encrypted"] = True
 
         result = self.verifier.prove_node_possession(
             manifest["placements"][0]["stored_on"][0],
@@ -708,20 +852,38 @@ class TestStoragePDP(unittest.TestCase):
         self.assertEqual(result.status, VerificationStatus.ERROR)
         self.assertIn("no RSA-PDP tags", result.message)
 
+    def test_pdp_refuses_legacy_unencrypted_content(self):
+        manifest = self.network.store_bytes(b"legacy plaintext " * 20)
+        node_id = manifest["placements"][0]["stored_on"][0]
+
+        result = self.verifier.prove_node_possession(node_id, manifest)
+
+        self.assertEqual(result.status, VerificationStatus.ERROR)
+        self.assertIn("not encrypted before storage", result.message)
+
     def test_pdp_survives_node_service_reload(self):
-        manifest = self.network.store_bytes(b"Remote PDP challenge " * 20)
+        manifest = self.store_encrypted(b"Remote PDP challenge " * 20)
         node_id = manifest["placements"][0]["stored_on"][0]
         node = self.network._get_node(node_id)
-        node_client = create_node_app(node_id, node.storage_dir).test_client()
+        node_client = create_node_app(
+            node_id,
+            node.storage_dir,
+            auth_token=NODE_AUTH_TOKEN,
+        ).test_client()
 
         class InMemoryNodeHTTP:
             def open(inner_self, request, timeout):
                 self.assertEqual(request.method, "POST")
                 self.assertEqual(timeout, 5)
+                self.assertEqual(
+                    request.get_header("Authorization"),
+                    f"Bearer {NODE_AUTH_TOKEN}",
+                )
                 response = node_client.post(
                     urlsplit(request.full_url).path,
                     data=request.data,
                     content_type="application/json",
+                    headers={"Authorization": request.get_header("Authorization")},
                 )
                 if response.status_code == 404:
                     raise HTTPError(request.full_url, 404, "Not found", {}, None)
@@ -729,7 +891,8 @@ class TestStoragePDP(unittest.TestCase):
                     raise AssertionError(f"Node service returned {response.status_code}")
                 return io.BytesIO(response.data)
 
-        self.network.node_urls[node_id] = "http://node-service.test"
+        self.network.node_auth_token = NODE_AUTH_TOKEN
+        self.network.node_urls[node_id] = "https://node-service.test"
         with patch("dcas.storage.network.build_opener", return_value=InMemoryNodeHTTP()):
             result = self.verifier.prove_node_possession(node_id, manifest)
 
@@ -739,6 +902,206 @@ class TestStoragePDP(unittest.TestCase):
         reloaded = StoragePDP.from_config(self.test_dir)
         self.assertEqual(reloaded.public_parameters, self.pdp.public_parameters)
 
+
+class TestPairingPoR(unittest.TestCase):
+    """Tests the educational pairing PoR and 2-of-3 coded storage path."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.por = PairingPoR(17)
+        self.network = StorageNetwork(
+            base_dir=os.path.join(self.test_dir, "network"),
+            num_nodes=3,
+            replication_factor=1,
+            pairing_por=self.por,
+        )
+        self.verifier = IntegrityVerifier(
+            self.network,
+            pairing_por_required=True,
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
+
+    def test_por_key_is_stable_across_restarts(self):
+        first = PairingPoR.from_config(self.test_dir)
+        second = PairingPoR.from_config(self.test_dir)
+        first_metadata = first.file_metadata("file", 0, 248)
+        second_metadata = second.file_metadata("file", 0, 248)
+        self.assertEqual(
+            first_metadata["public_key_g2_hex"],
+            second_metadata["public_key_g2_hex"],
+        )
+
+    def test_xor_code_reconstructs_from_every_pair(self):
+        original = bytes(range(251)) * 3
+        shards, _ = XorErasureCode.encode(original)
+
+        for pair in ((0, 1), (0, 2), (1, 2), (2, 0), (2, 1)):
+            with self.subTest(pair=pair):
+                recovered = XorErasureCode.decode(
+                    {index: shards[index] for index in pair},
+                    len(original),
+                )
+                self.assertEqual(recovered, original)
+
+    def test_network_retrieves_from_any_two_live_shards(self):
+        for unavailable_index in range(XorErasureCode.TOTAL_SHARDS):
+            payload = bytes([unavailable_index + 1]) * 600
+            manifest = self.network.store_por_bytes(payload)
+            unavailable = self.network._get_node(
+                manifest["placements"][unavailable_index]["stored_on"][0]
+            )
+            unavailable.is_online = False
+
+            try:
+                self.assertEqual(self.network.retrieve_file(manifest), payload)
+                audit = self.verifier.audit_network(manifest)
+                self.assertEqual(audit.status, VerificationStatus.WARNING)
+                self.assertEqual(audit.details["healthy_shards"], 2)
+            finally:
+                unavailable.is_online = True
+
+    def test_network_recovers_when_one_shard_is_corrupted(self):
+        payload = b"recoverable encrypted content " * 32
+        manifest = self.network.store_por_bytes(payload)
+        placement = manifest["placements"][0]
+        node = self.network._get_node(placement["stored_on"][0])
+        node.store_chunk(
+            placement["chunk_hash"],
+            b"x" * placement["chunk_size"],
+        )
+
+        self.assertEqual(self.network.retrieve_file(manifest), payload)
+        audit = self.verifier.audit_network(manifest)
+        self.assertEqual(audit.status, VerificationStatus.WARNING)
+        self.assertEqual(audit.details["healthy_shards"], 2)
+
+    def test_node_proof_is_bound_to_node_and_shard(self):
+        payload = b"encrypted storage fixture " * 40
+        manifest = self.network.store_por_bytes(payload)
+        placement = manifest["placements"][0]
+        node_id = placement["stored_on"][0]
+        node = self.network._get_node(node_id)
+        nonce = "ab" * 32
+        sectors = [
+            {
+                "sector_index": index,
+                "chunk_hash": placement["chunk_hash"],
+                "chunk_offset": index * XorErasureCode.SECTOR_SIZE,
+                "coefficient_hex": format(index + 11, "x"),
+            }
+            for index in (0, 1)
+        ]
+        response = self.network.request_por_proof(
+            node_id,
+            {
+                "file_id": manifest["cid"]["cid"],
+                "node_id": node_id,
+                "shard_index": placement["shard_index"],
+                "nonce_hex": nonce,
+                "sectors": sectors,
+            },
+        )
+        challenges = [
+            {
+                "sector_index": item["sector_index"],
+                "coefficient": int(item["coefficient_hex"], 16),
+            }
+            for item in sectors
+        ]
+
+        self.assertIsNotNone(response)
+        self.assertTrue(PairingPoR.verify_aggregate_proof(
+            manifest["cid"]["cid"],
+            node_id,
+            placement["shard_index"],
+            challenges,
+            response["sigma_hex"],
+            response["mu_hex"],
+            manifest["por"],
+        ))
+        self.assertFalse(PairingPoR.verify_aggregate_proof(
+            manifest["cid"]["cid"],
+            "different-node",
+            placement["shard_index"],
+            challenges,
+            response["sigma_hex"],
+            response["mu_hex"],
+            manifest["por"],
+        ))
+        self.assertFalse(PairingPoR.verify_aggregate_proof(
+            manifest["cid"]["cid"],
+            node_id,
+            (placement["shard_index"] + 1) % XorErasureCode.TOTAL_SHARDS,
+            challenges,
+            response["sigma_hex"],
+            response["mu_hex"],
+            manifest["por"],
+        ))
+
+    def test_authenticated_node_service_answers_por_challenges(self):
+        manifest = self.network.store_por_bytes(b"node service PoR fixture " * 40)
+        placement = manifest["placements"][0]
+        node_id = placement["stored_on"][0]
+        node = self.network._get_node(node_id)
+        client = create_node_app(
+            node_id,
+            node.storage_dir,
+            auth_token=NODE_AUTH_TOKEN,
+        ).test_client()
+        payload = {
+            "file_id": manifest["cid"]["cid"],
+            "node_id": node_id,
+            "shard_index": placement["shard_index"],
+            "nonce_hex": "cd" * 32,
+            "sectors": [
+                {
+                    "sector_index": index,
+                    "chunk_hash": placement["chunk_hash"],
+                    "chunk_offset": index * XorErasureCode.SECTOR_SIZE,
+                    "coefficient_hex": format(index + 3, "x"),
+                }
+                for index in (0, 1)
+            ],
+        }
+
+        response = client.post(
+            "/v1/por/challenge",
+            json=payload,
+            headers={"Authorization": f"Bearer {NODE_AUTH_TOKEN}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["node_id"], node_id)
+
+        payload["node_id"] = "different-node"
+        mismatch = client.post(
+            "/v1/por/challenge",
+            json=payload,
+            headers={"Authorization": f"Bearer {NODE_AUTH_TOKEN}"},
+        )
+        self.assertEqual(mismatch.status_code, 400)
+
+    def test_verifier_accepts_por_and_rejects_legacy_manifest(self):
+        payload = b"new encrypted file content " * 30
+        manifest = self.network.store_por_bytes(payload)
+        manifest["storage_encrypted"] = True
+        node_id = manifest["placements"][0]["stored_on"][0]
+        result = self.verifier.prove_node_possession(node_id, manifest, sample_count=2)
+        self.assertEqual(result.status, VerificationStatus.PASSED)
+
+        legacy_network = StorageNetwork(
+            base_dir=os.path.join(self.test_dir, "legacy"),
+            num_nodes=2,
+            replication_factor=1,
+        )
+        legacy_manifest = legacy_network.store_bytes(b"legacy data")
+        legacy_result = self.verifier.prove_node_possession(
+            legacy_manifest["placements"][0]["stored_on"][0],
+            legacy_manifest,
+        )
+        self.assertEqual(legacy_result.status, VerificationStatus.ERROR)
+        self.assertIn("legacy file", legacy_result.message)
 
 class TestMetadataStore(unittest.TestCase):
     """Tests for the metadata and audit store."""
