@@ -166,6 +166,9 @@ def create_node_app(
         challenged_node_id = payload.get("node_id")
         shard_index = payload.get("shard_index")
         nonce_hex = payload.get("nonce_hex")
+        scheme = payload.get("scheme")
+        sector_size = payload.get("sector_size")
+        field_elements_per_sector = payload.get("field_elements_per_sector")
         sectors = payload.get("sectors")
         if (
             not isinstance(file_id, str)
@@ -175,6 +178,16 @@ def create_node_app(
             or not isinstance(shard_index, int)
             or isinstance(shard_index, bool)
             or not 0 <= shard_index < XorErasureCode.TOTAL_SHARDS
+            or scheme not in (PairingPoR.SCHEME, PairingPoR.LEGACY_SCHEME)
+            or not isinstance(sector_size, int)
+            or isinstance(sector_size, bool)
+            or not XorErasureCode.MIN_SECTOR_SIZE
+            <= sector_size
+            <= XorErasureCode.MAX_SECTOR_SIZE
+            or not isinstance(field_elements_per_sector, int)
+            or isinstance(field_elements_per_sector, bool)
+            or field_elements_per_sector
+            != PairingPoR.field_elements_for_sector_size(sector_size)
         ):
             return jsonify({"error": "Invalid file, node, or shard identifier"}), 400
         if not isinstance(nonce_hex, str) or not re.fullmatch(r"[0-9a-f]{64}", nonce_hex):
@@ -200,7 +213,7 @@ def create_node_app(
                 or sector_index < 0
                 or not isinstance(chunk_offset, int)
                 or isinstance(chunk_offset, bool)
-                or chunk_offset != sector_index * XorErasureCode.SECTOR_SIZE
+                or chunk_offset != sector_index * sector_size
                 or not isinstance(coefficient_hex, str)
                 or not re.fullmatch(r"[0-9a-f]{1,64}", coefficient_hex)
             ):

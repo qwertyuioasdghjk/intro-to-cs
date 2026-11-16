@@ -11,6 +11,7 @@ import ipaddress
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
@@ -340,8 +341,14 @@ class StorageNetwork:
 
         cid = cid_override or self.cid_generator.generate(data)
         file_id = cid.cid_string
-        shards, shard_size = XorErasureCode.encode(data)
-        por_metadata = self.pairing_por.file_metadata(file_id, len(data), shard_size)
+        sector_size = XorErasureCode.calculate_sector_size(len(data))
+        shards, shard_size = XorErasureCode.encode(data, sector_size)
+        por_metadata = self.pairing_por.file_metadata(
+            file_id,
+            len(data),
+            shard_size,
+            sector_size,
+        )
         chunk_data_list = shards
         merkle_root = self.merkle_tree.build(chunk_data_list)
         merkle_proofs = [
@@ -358,27 +365,37 @@ class StorageNetwork:
         placements: list[dict] = []
         newly_stored: list[tuple[StorageNode, str]] = []
         newly_stored_proofs: list[tuple[StorageNode, str, str, int]] = []
-        newly_stored_tags: list[tuple[StorageNode, str, str, int, int]] = []
+        newly_stored_tags: list[tuple[StorageNode, str, str, int, list[int]]] = []
         selected_nodes: set[str] = set()
+        chunk_jobs: list[tuple[int, bytes, str, StorageNode, bool]] = []
+        shard_metadata_jobs: list[
+            tuple[StorageNode, str, int, dict, dict[int, str]]
+        ] = []
         try:
             for shard_index, shard in enumerate(shards):
                 chunk_hash = self.chunker.engine.hash_bytes(shard)
-                chunk_node = None
-                for node in online_nodes:
-                    if node.node_id in selected_nodes:
-                        continue
-                    already_present = node.has_chunk(chunk_hash)
-                    if node.store_chunk(chunk_hash, shard):
-                        chunk_node = node
-                        if not already_present:
-                            newly_stored.append((node, chunk_hash))
-                        break
+                chunk_node = next(
+                    (
+                        node
+                        for node in online_nodes
+                        if node.node_id not in selected_nodes
+                        and node.can_store_chunk(chunk_hash, len(shard))
+                    ),
+                    None,
+                )
                 if chunk_node is None:
                     raise RuntimeError(
                         f"Could not store coded PoR shard {shard_index} on a unique node."
                     )
 
                 selected_nodes.add(chunk_node.node_id)
+                chunk_jobs.append((
+                    shard_index,
+                    shard,
+                    chunk_hash,
+                    chunk_node,
+                    chunk_node.has_chunk(chunk_hash),
+                ))
                 placement = {
                     "chunk_index": shard_index,
                     "shard_index": shard_index,
@@ -388,19 +405,39 @@ class StorageNetwork:
                 }
                 placements.append(placement)
 
-                proof = merkle_proofs[shard_index]
-                if chunk_node.store_merkle_proof(chunk_hash, merkle_root, proof):
-                    newly_stored_proofs.append((
-                        chunk_node,
-                        chunk_hash,
-                        merkle_root,
-                        shard_index,
-                    ))
-                elif not chunk_node.has_chunk(chunk_hash):
+            def store_shard_chunk(
+                job: tuple[int, bytes, str, StorageNode, bool],
+            ) -> None:
+                shard_index, shard, chunk_hash, node, _ = job
+                if not node.store_chunk(chunk_hash, shard):
                     raise RuntimeError(
-                        f"Storage node {chunk_node.node_id} cannot persist its Merkle proof."
+                        f"Could not store coded PoR shard {shard_index} "
+                        f"on node {node.node_id}."
                     )
 
+            chunk_error = None
+            with ThreadPoolExecutor(
+                max_workers=XorErasureCode.TOTAL_SHARDS,
+            ) as executor:
+                futures = [
+                    executor.submit(store_shard_chunk, job)
+                    for job in chunk_jobs
+                ]
+                for job, future in zip(chunk_jobs, futures):
+                    try:
+                        future.result()
+                    except Exception as error:
+                        if chunk_error is None:
+                            chunk_error = error
+                        continue
+
+                    _, _, chunk_hash, node, already_present = job
+                    if not already_present:
+                        newly_stored.append((node, chunk_hash))
+            if chunk_error is not None:
+                raise chunk_error
+
+            for shard_index, shard, chunk_hash, chunk_node, _ in chunk_jobs:
                 tags = self.pairing_por.create_tags(
                     file_id,
                     chunk_node.node_id,
@@ -408,37 +445,105 @@ class StorageNetwork:
                     shard,
                     por_metadata,
                 )
-                for sector_index, tag in enumerate(tags):
-                    if chunk_node.store_por_tag(
+                shard_metadata_jobs.append((
+                    chunk_node,
+                    chunk_hash,
+                    shard_index,
+                    merkle_proofs[shard_index],
+                    {sector_index: tag for sector_index, tag in enumerate(tags)},
+                ))
+
+            def persist_shard_metadata(
+                job: tuple[StorageNode, str, int, dict, dict[int, str]],
+            ) -> tuple[bool, list[int]]:
+                node, chunk_hash, shard_index, proof, tags = job
+                proof_added = False
+                tag_indices = []
+                try:
+                    proof_added = node.store_merkle_proof(
+                        chunk_hash,
+                        merkle_root,
+                        proof,
+                    )
+                    if not proof_added and not node.has_chunk(chunk_hash):
+                        raise RuntimeError(
+                            f"Storage node {node.node_id} cannot persist the Merkle proof."
+                        )
+
+                    tag_indices = node.store_por_tags(
                         chunk_hash,
                         file_id,
-                        chunk_node.node_id,
+                        node.node_id,
                         shard_index,
-                        sector_index,
-                        tag,
-                    ):
+                        tags,
+                    )
+                    if not tag_indices and not node.has_chunk(chunk_hash):
+                        raise RuntimeError(
+                            f"Storage node {node.node_id} cannot persist the PoR tags."
+                        )
+                    return proof_added, tag_indices
+                except Exception:
+                    if tag_indices:
+                        node.remove_por_tags(
+                            chunk_hash,
+                            file_id,
+                            node.node_id,
+                            shard_index,
+                            tag_indices,
+                        )
+                    if proof_added:
+                        node.remove_merkle_proof(
+                            chunk_hash,
+                            merkle_root,
+                            shard_index,
+                        )
+                    raise
+
+            metadata_error = None
+            with ThreadPoolExecutor(
+                max_workers=XorErasureCode.TOTAL_SHARDS,
+            ) as executor:
+                futures = [
+                    executor.submit(persist_shard_metadata, job)
+                    for job in shard_metadata_jobs
+                ]
+                for job, future in zip(shard_metadata_jobs, futures):
+                    try:
+                        proof_added, tag_indices = future.result()
+                    except Exception as error:
+                        if metadata_error is None:
+                            metadata_error = error
+                        continue
+
+                    node, chunk_hash, shard_index, _, _ = job
+                    if proof_added:
+                        newly_stored_proofs.append((
+                            node,
+                            chunk_hash,
+                            merkle_root,
+                            shard_index,
+                        ))
+                    if tag_indices:
                         newly_stored_tags.append((
-                            chunk_node,
+                            node,
                             chunk_hash,
                             file_id,
                             shard_index,
-                            sector_index,
+                            tag_indices,
                         ))
-                    elif not chunk_node.has_chunk(chunk_hash):
-                        raise RuntimeError(
-                            f"Storage node {chunk_node.node_id} cannot persist its PoR tag."
-                        )
+            if metadata_error is not None:
+                raise metadata_error
 
         except Exception:
-            for node, chunk_hash, tagged_file_id, shard_index, sector_index in reversed(
+            for node, chunk_hash, tagged_file_id, shard_index, sector_indices in reversed(
                 newly_stored_tags
             ):
-                node.remove_por_tag(
+                node.remove_por_tags(
                     chunk_hash,
                     tagged_file_id,
                     node.node_id,
                     shard_index,
-                    sector_index,
+                    sector_indices,
                 )
             for node, chunk_hash, root_hash, leaf_index in reversed(newly_stored_proofs):
                 node.remove_merkle_proof(chunk_hash, root_hash, leaf_index)
@@ -460,6 +565,7 @@ class StorageNetwork:
                 "data_shards": XorErasureCode.DATA_SHARDS,
                 "total_shards": XorErasureCode.TOTAL_SHARDS,
                 "shard_size": shard_size,
+                "sector_size": sector_size,
             },
             "por": por_metadata,
             "por_status": "active",
@@ -518,16 +624,37 @@ class StorageNetwork:
         """Retrieve any two valid coded shards and reconstruct stored bytes."""
         erasure_metadata = manifest.get("erasure_coding")
         por_metadata = manifest.get("por")
+        sector_size = (
+            por_metadata.get("sector_size", XorErasureCode.SECTOR_SIZE)
+            if isinstance(por_metadata, dict)
+            else None
+        )
         if (
             not isinstance(erasure_metadata, dict)
             or erasure_metadata.get("data_shards") != XorErasureCode.DATA_SHARDS
             or erasure_metadata.get("total_shards") != XorErasureCode.TOTAL_SHARDS
             or not isinstance(por_metadata, dict)
+            or por_metadata.get("scheme")
+            not in (PairingPoR.SCHEME, PairingPoR.LEGACY_SCHEME)
             or not isinstance(por_metadata.get("storage_size"), int)
             or isinstance(por_metadata.get("storage_size"), bool)
             or not isinstance(erasure_metadata.get("shard_size"), int)
             or isinstance(erasure_metadata.get("shard_size"), bool)
             or por_metadata.get("shard_size") != erasure_metadata.get("shard_size")
+            or not isinstance(sector_size, int)
+            or isinstance(sector_size, bool)
+            or not XorErasureCode.MIN_SECTOR_SIZE
+            <= sector_size
+            <= XorErasureCode.MAX_SECTOR_SIZE
+            or erasure_metadata["shard_size"] % sector_size
+            or not isinstance(por_metadata.get("sector_count_per_shard"), int)
+            or isinstance(por_metadata.get("sector_count_per_shard"), bool)
+            or por_metadata.get("sector_count_per_shard")
+            != erasure_metadata["shard_size"] // sector_size
+            or (
+                erasure_metadata.get("sector_size") is not None
+                and erasure_metadata.get("sector_size") != sector_size
+            )
         ):
             return None
 
@@ -580,6 +707,7 @@ class StorageNetwork:
             return XorErasureCode.decode(
                 available_shards,
                 por_metadata["storage_size"],
+                sector_size,
             )
         except (KeyError, TypeError, ValueError):
             return None

@@ -66,6 +66,19 @@ class StorageNode:
 
     # ── Storage operations ──────────────────────────────────────────
 
+    def can_store_chunk(self, chunk_hash: str, data_size: int) -> bool:
+        """Check node availability and capacity for a chunk without writing it."""
+        if not isinstance(data_size, int) or isinstance(data_size, bool) or data_size < 0:
+            raise ValueError("Chunk size must be a non-negative integer.")
+        if not self.is_online:
+            return False
+
+        existing_size = self._metadata.get(chunk_hash, {}).get("size", 0)
+        return (
+            self.capacity <= 0
+            or self.used_space - existing_size + data_size <= self.capacity
+        )
+
     def store_chunk(self, chunk_hash: str, data: bytes) -> bool:
         """
         Store a chunk on this node.
@@ -78,11 +91,7 @@ class StorageNode:
             True if stored successfully, False if the node is offline
             or has insufficient capacity.
         """
-        if not self.is_online:
-            return False
-
-        existing_size = self._metadata.get(chunk_hash, {}).get("size", 0)
-        if self.capacity > 0 and self.used_space - existing_size + len(data) > self.capacity:
+        if not self.can_store_chunk(chunk_hash, len(data)):
             return False
 
         chunk_path = os.path.join(self.storage_dir, chunk_hash)
@@ -228,23 +237,60 @@ class StorageNode:
         tag: str,
     ) -> bool:
         """Persist a pairing authenticator bound to this node and shard."""
+        return bool(self.store_por_tags(
+            chunk_hash,
+            file_id,
+            node_id,
+            shard_index,
+            {sector_index: tag},
+        ))
+
+    def store_por_tags(
+        self,
+        chunk_hash: str,
+        file_id: str,
+        node_id: str,
+        shard_index: int,
+        tags: dict[int, str],
+    ) -> list[int]:
+        """Persist multiple pairing authenticators with one metadata write."""
         if node_id != self.node_id or not self.has_chunk(chunk_hash):
-            return False
+            return []
+        if not isinstance(tags, dict) or any(
+            not isinstance(sector_index, int)
+            or isinstance(sector_index, bool)
+            or sector_index < 0
+            for sector_index in tags
+        ):
+            raise ValueError("PoR sector indices must be non-negative integers.")
+
+        shard_tags = (
+            self._metadata[chunk_hash]
+            .get("por_tags", {})
+            .get(file_id, {})
+            .get(node_id, {})
+            .get(str(shard_index), {})
+        )
+        new_tags = []
+        for sector_index, tag in tags.items():
+            index = str(sector_index)
+            existing = shard_tags.get(index)
+            if existing is not None and existing != tag:
+                raise ValueError("Conflicting PoR tag already stored for this sector.")
+            if existing is None:
+                new_tags.append((sector_index, index, tag))
+
+        if not new_tags:
+            return []
 
         por_tags = self._metadata[chunk_hash].setdefault("por_tags", {})
         file_tags = por_tags.setdefault(file_id, {})
         node_tags = file_tags.setdefault(node_id, {})
         shard_tags = node_tags.setdefault(str(shard_index), {})
-        index = str(sector_index)
-        existing = shard_tags.get(index)
-        if existing is not None:
-            if existing != tag:
-                raise ValueError("Conflicting PoR tag already stored for this sector.")
-            return False
-
-        shard_tags[index] = tag
+        for _, index, tag in new_tags:
+            shard_tags[index] = tag
         self._save_metadata()
-        return True
+        return [sector_index for sector_index, _, _ in new_tags]
 
     def remove_por_tag(
         self,
@@ -255,6 +301,23 @@ class StorageNode:
         sector_index: int,
     ):
         """Remove a newly added PoR tag when a storage operation rolls back."""
+        self.remove_por_tags(
+            chunk_hash,
+            file_id,
+            node_id,
+            shard_index,
+            [sector_index],
+        )
+
+    def remove_por_tags(
+        self,
+        chunk_hash: str,
+        file_id: str,
+        node_id: str,
+        shard_index: int,
+        sector_indices: list[int],
+    ):
+        """Remove multiple pairing authenticators with one metadata write."""
         chunk_metadata = self._metadata.get(chunk_hash)
         if chunk_metadata is None:
             return
@@ -263,7 +326,13 @@ class StorageNode:
         file_tags = por_tags.get(file_id, {})
         node_tags = file_tags.get(node_id, {})
         shard_tags = node_tags.get(str(shard_index), {})
-        shard_tags.pop(str(sector_index), None)
+        removed = False
+        for sector_index in sector_indices:
+            if str(sector_index) in shard_tags:
+                shard_tags.pop(str(sector_index))
+                removed = True
+        if not removed:
+            return
         if not shard_tags:
             node_tags.pop(str(shard_index), None)
         if not node_tags:
@@ -283,6 +352,9 @@ class StorageNode:
         node_id = payload.get("node_id")
         shard_index = payload.get("shard_index")
         nonce_hex = payload.get("nonce_hex")
+        scheme = payload.get("scheme")
+        sector_size = payload.get("sector_size")
+        field_elements_per_sector = payload.get("field_elements_per_sector")
         sectors = payload.get("sectors")
         if (
             not isinstance(file_id, str)
@@ -292,6 +364,16 @@ class StorageNode:
             or isinstance(shard_index, bool)
             or not 0 <= shard_index < XorErasureCode.TOTAL_SHARDS
             or not isinstance(nonce_hex, str)
+            or scheme not in (PairingPoR.SCHEME, PairingPoR.LEGACY_SCHEME)
+            or not isinstance(sector_size, int)
+            or isinstance(sector_size, bool)
+            or not XorErasureCode.MIN_SECTOR_SIZE
+            <= sector_size
+            <= XorErasureCode.MAX_SECTOR_SIZE
+            or not isinstance(field_elements_per_sector, int)
+            or isinstance(field_elements_per_sector, bool)
+            or field_elements_per_sector
+            != PairingPoR.field_elements_for_sector_size(sector_size)
             or not isinstance(sectors, list)
             or not 2 <= len(sectors) <= PairingPoR.MAX_CHALLENGE_SECTORS
         ):
@@ -314,7 +396,7 @@ class StorageNode:
                 or not isinstance(chunk_hash, str)
                 or not isinstance(chunk_offset, int)
                 or isinstance(chunk_offset, bool)
-                or chunk_offset != sector_index * XorErasureCode.SECTOR_SIZE
+                or chunk_offset != sector_index * sector_size
                 or not isinstance(coefficient_hex, str)
                 or not 1 <= len(coefficient_hex) <= 64
             ):
@@ -337,15 +419,18 @@ class StorageNode:
             if (
                 chunk_data is None
                 or tag is None
-                or chunk_offset + XorErasureCode.SECTOR_SIZE > len(chunk_data)
+                or chunk_offset + sector_size > len(chunk_data)
             ):
                 return None
             sector_data = chunk_data[
-                chunk_offset:chunk_offset + XorErasureCode.SECTOR_SIZE
+                chunk_offset:chunk_offset + sector_size
             ]
             response_sectors.append((tag, sector_data, coefficient))
 
-        sigma_hex, mu_hex = PairingPoR.aggregate_response(response_sectors)
+        sigma_hex, mu_hex = PairingPoR.aggregate_response(
+            response_sectors,
+            sector_size,
+        )
         return {
             "node_id": node_id,
             "shard_index": shard_index,

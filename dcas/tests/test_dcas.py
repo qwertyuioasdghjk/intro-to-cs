@@ -12,10 +12,13 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
+
+from py_ecc.optimized_bls12_381 import G1, add, multiply
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,6 +33,7 @@ from dcas.storage.node_server import create_node_app
 from dcas.storage.pdp import StoragePDP
 from dcas.storage.encryption import StorageEncryptor
 from dcas.storage.erasure import XorErasureCode
+import dcas.storage.por as por_module
 from dcas.storage.por import PairingPoR
 from dcas.verifier.verifier import IntegrityVerifier, VerificationStatus
 from dcas.database.metadata import MetadataStore
@@ -319,6 +323,43 @@ class TestStorageNode(unittest.TestCase):
         node = StorageNode("limited", os.path.join(self.test_dir, "limited"), capacity=10)
         self.assertTrue(node.store_chunk("h1", b"12345"))
         self.assertFalse(node.store_chunk("h2", b"123456"))  # Would exceed 10 bytes
+
+    def test_por_tags_are_batched_and_conflicts_do_not_partially_write(self):
+        self.node.store_chunk("por-hash", b"shard")
+        tags = {0: "tag-0", 1: "tag-1"}
+        with patch.object(self.node, "_save_metadata") as save_metadata:
+            self.assertEqual(
+                self.node.store_por_tags(
+                    "por-hash", "file", self.node.node_id, 0, tags
+                ),
+                [0, 1],
+            )
+            save_metadata.assert_called_once()
+
+            save_metadata.reset_mock()
+            self.assertEqual(
+                self.node.store_por_tags(
+                    "por-hash", "file", self.node.node_id, 0, tags
+                ),
+                [],
+            )
+            save_metadata.assert_not_called()
+
+            with self.assertRaisesRegex(ValueError, "Conflicting PoR tag"):
+                self.node.store_por_tags(
+                    "por-hash",
+                    "file",
+                    self.node.node_id,
+                    0,
+                    {2: "new-tag", 1: "conflicting-tag"},
+                )
+            save_metadata.assert_not_called()
+            self.assertNotIn(
+                "2",
+                self.node._metadata["por-hash"]["por_tags"]["file"][
+                    self.node.node_id
+                ]["0"],
+            )
 
     def test_list_chunks(self):
         """List stored chunks."""
@@ -742,6 +783,9 @@ class TestStorageNodeServiceAuth(unittest.TestCase):
                 "file_id": "file",
                 "node_id": self.node.node_id,
                 "shard_index": 0,
+                "scheme": PairingPoR.SCHEME,
+                "sector_size": XorErasureCode.SECTOR_SIZE,
+                "field_elements_per_sector": PairingPoR.FIELD_ELEMENTS_PER_SECTOR,
                 "nonce_hex": "00" * 32,
                 "sectors": [{}],
             },
@@ -953,8 +997,8 @@ class TestPairingPoR(unittest.TestCase):
     def test_por_key_is_stable_across_restarts(self):
         first = PairingPoR.from_config(self.test_dir)
         second = PairingPoR.from_config(self.test_dir)
-        first_metadata = first.file_metadata("file", 0, 248)
-        second_metadata = second.file_metadata("file", 0, 248)
+        first_metadata = first.file_metadata("file", 248, 248, 124)
+        second_metadata = second.file_metadata("file", 248, 248, 124)
         self.assertEqual(
             first_metadata["public_key_g2_hex"],
             second_metadata["public_key_g2_hex"],
@@ -986,6 +1030,167 @@ class TestPairingPoR(unittest.TestCase):
                     len(original),
                 )
                 self.assertEqual(recovered, original)
+
+    @unittest.skipUnless(
+        PairingPoR.NATIVE_BACKEND_AVAILABLE,
+        "The optional native BLS12-381 backend is not installed.",
+    )
+    def test_native_tags_match_py_ecc_reference(self):
+        data = bytes(range(248))
+        parameters = self.por.file_metadata(
+            "native-backend-file",
+            len(data),
+            len(data),
+            XorErasureCode.SECTOR_SIZE,
+        )
+        native_tags = self.por.create_tags(
+            "native-backend-file",
+            "node-000",
+            0,
+            data,
+            parameters,
+        )
+        with patch.object(por_module, "_arkworks", None):
+            python_tags = self.por.create_tags(
+                "native-backend-file",
+                "node-000",
+                0,
+                data,
+                parameters,
+            )
+
+        self.assertEqual(native_tags, python_tags)
+
+    def test_por_shard_writes_are_concurrent(self):
+        chunk_barrier = threading.Barrier(XorErasureCode.TOTAL_SHARDS)
+        tag_barrier = threading.Barrier(XorErasureCode.TOTAL_SHARDS)
+        for node in self.network.nodes:
+            store_chunk = node.store_chunk
+            store_por_tags = node.store_por_tags
+
+            def wait_for_all_chunk_writes(
+                *args,
+                store_chunk=store_chunk,
+                **kwargs,
+            ):
+                chunk_barrier.wait(timeout=5)
+                return store_chunk(*args, **kwargs)
+
+            def wait_for_all_tag_writes(
+                *args,
+                store_por_tags=store_por_tags,
+                **kwargs,
+            ):
+                tag_barrier.wait(timeout=5)
+                return store_por_tags(*args, **kwargs)
+
+            node.store_chunk = wait_for_all_chunk_writes
+            node.store_por_tags = wait_for_all_tag_writes
+
+        with patch.object(self.por, "create_tags", return_value=["tag-0", "tag-1"]):
+            manifest = self.network.store_por_bytes(b"concurrent metadata test")
+
+        self.assertEqual(len(manifest["placements"]), XorErasureCode.TOTAL_SHARDS)
+
+    def test_dynamic_sector_calculator_enforces_minimum_and_maximum(self):
+        self.assertEqual(XorErasureCode.calculate_sector_size(0), 1)
+        self.assertEqual(XorErasureCode.calculate_sector_size(4), 1)
+        self.assertEqual(XorErasureCode.calculate_sector_size(5), 2)
+        self.assertEqual(XorErasureCode.calculate_sector_size(16_384), 4096)
+        self.assertEqual(XorErasureCode.calculate_sector_size(100_000), 4096)
+        for invalid_size in (-1, 1.5, True):
+            with self.subTest(invalid_size=invalid_size):
+                with self.assertRaises(ValueError):
+                    XorErasureCode.calculate_sector_size(invalid_size)
+
+    def test_small_upload_uses_dynamic_sector_size_and_minimum_sector_count(self):
+        payload = b"small file"
+        manifest = self.network.store_por_bytes(payload)
+        sector_size = manifest["por"]["sector_size"]
+
+        self.assertEqual(sector_size, 3)
+        self.assertEqual(manifest["erasure_coding"]["sector_size"], sector_size)
+        self.assertEqual(manifest["por"]["sector_count_per_shard"], 2)
+        self.assertTrue(all(
+            placement["chunk_size"] == 2 * sector_size
+            for placement in manifest["placements"]
+        ))
+        self.assertEqual(self.network.retrieve_file(manifest), payload)
+
+        manifest["storage_encrypted"] = True
+        node_id = manifest["placements"][0]["stored_on"][0]
+        proof = self.verifier.prove_node_possession(node_id, manifest, sample_count=2)
+        self.assertEqual(proof.status, VerificationStatus.PASSED)
+
+    def test_large_upload_uses_capped_sector_size_and_verifies(self):
+        manifest = self.network.store_por_bytes(b"l" * 16_384)
+
+        self.assertEqual(manifest["por"]["sector_size"], XorErasureCode.MAX_SECTOR_SIZE)
+        self.assertEqual(manifest["por"]["field_elements_per_sector"], 133)
+        self.assertEqual(manifest["por"]["sector_count_per_shard"], 2)
+
+        manifest["storage_encrypted"] = True
+        node_id = manifest["placements"][0]["stored_on"][0]
+        proof = self.verifier.prove_node_possession(node_id, manifest, sample_count=2)
+        self.assertEqual(proof.status, VerificationStatus.PASSED)
+
+        malformed = dict(manifest)
+        malformed["por"] = dict(manifest["por"])
+        malformed["por"]["sector_size"] -= 1
+        rejected = self.verifier.prove_node_possession(node_id, malformed, sample_count=2)
+        self.assertEqual(rejected.status, VerificationStatus.ERROR)
+
+    def test_legacy_fixed_sector_proof_remains_verifiable(self):
+        file_id = "legacy-file"
+        node_id = "node-legacy"
+        shard_index = 0
+        sector_size = XorErasureCode.SECTOR_SIZE
+        metadata = self.por.file_metadata(
+            file_id,
+            248,
+            248,
+            sector_size,
+        )
+        metadata["scheme"] = PairingPoR.LEGACY_SCHEME
+        sectors = [b"a" * sector_size, b"b" * sector_size]
+        tagged_sectors = []
+        challenges = []
+        for index, (sector, coefficient) in enumerate(zip(sectors, (7, 11))):
+            tag_point = PairingPoR._hash_sector(
+                file_id,
+                node_id,
+                shard_index,
+                index,
+                sector_size,
+                PairingPoR.LEGACY_SCHEME,
+            )
+            for base_hex, value in zip(
+                metadata["u_g1_hex"],
+                PairingPoR._sector_values(sector, sector_size),
+            ):
+                tag_point = add(
+                    tag_point,
+                    multiply(PairingPoR._decode_g1(base_hex), value),
+                )
+            tag_hex = PairingPoR._encode_g1(
+                multiply(tag_point, self.por._private_scalar)
+            )
+            tagged_sectors.append((tag_hex, sector, coefficient))
+            challenges.append({
+                "sector_index": index,
+                "coefficient": coefficient,
+            })
+
+        sigma, mu = PairingPoR.aggregate_response(tagged_sectors, sector_size)
+        self.assertTrue(PairingPoR.verify_aggregate_proof(
+            file_id,
+            node_id,
+            shard_index,
+            challenges,
+            sigma,
+            mu,
+            metadata,
+        ))
 
     def test_network_retrieves_from_any_two_live_shards(self):
         for unavailable_index in range(XorErasureCode.TOTAL_SHARDS):
@@ -1030,7 +1235,7 @@ class TestPairingPoR(unittest.TestCase):
             {
                 "sector_index": index,
                 "chunk_hash": placement["chunk_hash"],
-                "chunk_offset": index * XorErasureCode.SECTOR_SIZE,
+                "chunk_offset": index * manifest["por"]["sector_size"],
                 "coefficient_hex": format(index + 11, "x"),
             }
             for index in (0, 1)
@@ -1041,6 +1246,9 @@ class TestPairingPoR(unittest.TestCase):
                 "file_id": manifest["cid"]["cid"],
                 "node_id": node_id,
                 "shard_index": placement["shard_index"],
+                "scheme": manifest["por"]["scheme"],
+                "sector_size": manifest["por"]["sector_size"],
+                "field_elements_per_sector": manifest["por"]["field_elements_per_sector"],
                 "nonce_hex": nonce,
                 "sectors": sectors,
             },
@@ -1096,12 +1304,15 @@ class TestPairingPoR(unittest.TestCase):
             "file_id": manifest["cid"]["cid"],
             "node_id": node_id,
             "shard_index": placement["shard_index"],
+            "scheme": manifest["por"]["scheme"],
+            "sector_size": manifest["por"]["sector_size"],
+            "field_elements_per_sector": manifest["por"]["field_elements_per_sector"],
             "nonce_hex": "cd" * 32,
             "sectors": [
                 {
                     "sector_index": index,
                     "chunk_hash": placement["chunk_hash"],
-                    "chunk_offset": index * XorErasureCode.SECTOR_SIZE,
+                    "chunk_offset": index * manifest["por"]["sector_size"],
                     "coefficient_hex": format(index + 3, "x"),
                 }
                 for index in (0, 1)

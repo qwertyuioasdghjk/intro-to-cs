@@ -187,7 +187,7 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(checked.get_json()["details"]["data_bytes_returned"], 0)
         self.assertEqual(
             checked.get_json()["details"]["scheme"],
-            "dcas-pairing-por-2of3-edu-v1",
+            "dcas-pairing-por-2of3-edu-v2",
         )
 
         invalid = self.client.post(

@@ -906,9 +906,23 @@ class IntegrityVerifier:
         cid_str = manifest.get("cid", {}).get("cid")
         por_metadata = manifest.get("por")
         erasure_metadata = manifest.get("erasure_coding")
+        sector_size = (
+            por_metadata.get("sector_size", XorErasureCode.SECTOR_SIZE)
+            if isinstance(por_metadata, dict)
+            else None
+        )
+        field_elements_per_sector = (
+            por_metadata.get(
+                "field_elements_per_sector",
+                PairingPoR.FIELD_ELEMENTS_PER_SECTOR,
+            )
+            if isinstance(por_metadata, dict)
+            else None
+        )
         if (
             not isinstance(por_metadata, dict)
-            or por_metadata.get("scheme") != PairingPoR.SCHEME
+            or por_metadata.get("scheme")
+            not in (PairingPoR.SCHEME, PairingPoR.LEGACY_SCHEME)
             or por_metadata.get("curve") != PairingPoR.CURVE
             or not isinstance(cid_str, str)
             or not cid_str
@@ -918,9 +932,19 @@ class IntegrityVerifier:
             or erasure_metadata.get("data_shards") != XorErasureCode.DATA_SHARDS
             or erasure_metadata.get("total_shards") != XorErasureCode.TOTAL_SHARDS
             or manifest.get("storage_encrypted") is not True
-            or por_metadata.get("sector_size") != XorErasureCode.SECTOR_SIZE
-            or por_metadata.get("field_elements_per_sector")
-            != PairingPoR.FIELD_ELEMENTS_PER_SECTOR
+            or not isinstance(sector_size, int)
+            or isinstance(sector_size, bool)
+            or not XorErasureCode.MIN_SECTOR_SIZE
+            <= sector_size
+            <= XorErasureCode.MAX_SECTOR_SIZE
+            or not isinstance(field_elements_per_sector, int)
+            or isinstance(field_elements_per_sector, bool)
+            or field_elements_per_sector
+            != PairingPoR.field_elements_for_sector_size(sector_size)
+            or (
+                erasure_metadata.get("sector_size") is not None
+                and erasure_metadata.get("sector_size") != sector_size
+            )
             or not isinstance(por_metadata.get("sector_count_per_shard"), int)
             or isinstance(por_metadata.get("sector_count_per_shard"), bool)
             or por_metadata.get("sector_count_per_shard")
@@ -928,7 +952,7 @@ class IntegrityVerifier:
             or not isinstance(por_metadata.get("shard_size"), int)
             or por_metadata.get("shard_size") != erasure_metadata.get("shard_size")
             or por_metadata.get("shard_size")
-            != por_metadata.get("sector_count_per_shard") * XorErasureCode.SECTOR_SIZE
+            != por_metadata.get("sector_count_per_shard") * sector_size
             or not isinstance(por_metadata.get("storage_size"), int)
             or isinstance(por_metadata.get("storage_size"), bool)
             or por_metadata.get("storage_size") != manifest.get("storage_size")
@@ -1008,7 +1032,7 @@ class IntegrityVerifier:
             {
                 "sector_index": index,
                 "chunk_hash": placement["chunk_hash"],
-                "chunk_offset": index * XorErasureCode.SECTOR_SIZE,
+                "chunk_offset": index * sector_size,
             }
             for index in range(sector_count)
         ]
@@ -1040,6 +1064,9 @@ class IntegrityVerifier:
             "file_id": cid_str,
             "node_id": node_id,
             "shard_index": shard_index,
+            "scheme": por_metadata["scheme"],
+            "sector_size": sector_size,
+            "field_elements_per_sector": field_elements_per_sector,
             "nonce_hex": nonce,
             "sectors": challenges,
         }
@@ -1071,7 +1098,7 @@ class IntegrityVerifier:
             and re.fullmatch(r"[0-9a-f]{96}", response["sigma_hex"])
             and isinstance(response.get("mu_hex"), str)
             and re.fullmatch(
-                rf"[0-9a-f]{{{64 * PairingPoR.FIELD_ELEMENTS_PER_SECTOR}}}",
+                rf"[0-9a-f]{{{64 * field_elements_per_sector}}}",
                 response["mu_hex"],
             )
         )
@@ -1098,7 +1125,7 @@ class IntegrityVerifier:
             details={
                 "node_id": node_id,
                 "shard_index": shard_index,
-                "scheme": PairingPoR.SCHEME,
+                "scheme": por_metadata["scheme"],
                 "sample_count": sample_count,
                 "sector_indices": [item["sector_index"] for item in challenges],
                 "nonce_hex": nonce,
@@ -1133,7 +1160,8 @@ class IntegrityVerifier:
         erasure_metadata = manifest.get("erasure_coding")
         por_manifest = (
             isinstance(manifest.get("por"), dict)
-            and manifest["por"].get("scheme") == PairingPoR.SCHEME
+            and manifest["por"].get("scheme")
+            in (PairingPoR.SCHEME, PairingPoR.LEGACY_SCHEME)
             and isinstance(erasure_metadata, dict)
             and erasure_metadata.get("scheme") == "xor-2-of-3"
         )

@@ -1,8 +1,11 @@
 """Educational publicly verifiable pairing-based proof of retrievability."""
 
 import hashlib
+import logging
 import os
 import secrets
+from functools import lru_cache
+from importlib import import_module
 from typing import Any
 
 from eth_utils import ValidationError
@@ -18,16 +21,32 @@ from py_ecc.optimized_bls12_381 import G1, G2, Z1, add, curve_order, multiply, p
 from .erasure import XorErasureCode
 from .key_security import secure_new_private_file, secure_private_file
 
+_LOGGER = logging.getLogger(__name__)
+try:
+    _arkworks: Any = import_module("py_arkworks_bls12381")
+except ModuleNotFoundError as error:
+    if error.name != "py_arkworks_bls12381":
+        raise
+    _arkworks = None
+    _LOGGER.warning(
+        "py_arkworks_bls12381 is unavailable; PoR tags will use the slower py-ecc backend."
+    )
+
 
 class PairingPoR:
     """Tag coded sectors with homomorphic BLS-style pairing authenticators."""
 
-    SCHEME = "dcas-pairing-por-2of3-edu-v1"
+    SCHEME = "dcas-pairing-por-2of3-edu-v2"
+    LEGACY_SCHEME = "dcas-pairing-por-2of3-edu-v1"
     CURVE = "BLS12-381"
     FIELD_ELEMENT_SIZE = 31
     FIELD_ELEMENTS_PER_SECTOR = XorErasureCode.SECTOR_SIZE // FIELD_ELEMENT_SIZE
+    MAX_FIELD_ELEMENTS_PER_SECTOR = (
+        XorErasureCode.MAX_SECTOR_SIZE + FIELD_ELEMENT_SIZE - 1
+    ) // FIELD_ELEMENT_SIZE
     HASH_TO_CURVE_DST = b"DCAS_PAIRING_POR_BLS12381G1_XMD:SHA-256_SSWU_RO_V1"
     MAX_CHALLENGE_SECTORS = 64
+    NATIVE_BACKEND_AVAILABLE = _arkworks is not None
 
     def __init__(self, private_scalar: int):
         if not isinstance(private_scalar, int) or not 1 <= private_scalar < curve_order:
@@ -92,6 +111,33 @@ class PairingPoR:
             raise ValueError("Invalid compressed BLS12-381 G2 point.")
         return signature_to_G2(bytes.fromhex(encoded))
 
+    @staticmethod
+    @lru_cache(maxsize=8)
+    def _decode_native_bases(encoded_bases: tuple[str, ...]) -> tuple[Any, ...]:
+        if _arkworks is None:
+            raise RuntimeError("The native BLS12-381 backend is unavailable.")
+        return tuple(
+            _arkworks.G1Point.from_compressed_bytes(bytes.fromhex(encoded))
+            for encoded in encoded_bases
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _native_g1_generator():
+        if _arkworks is None:
+            raise RuntimeError("The native BLS12-381 backend is unavailable.")
+        return _arkworks.G1Point()
+
+    @staticmethod
+    @lru_cache(maxsize=8192)
+    def _native_hash_sector(label: bytes):
+        if _arkworks is None:
+            raise RuntimeError("The native BLS12-381 backend is unavailable.")
+        return _arkworks.G1Point.hash_to_curve(
+            label,
+            PairingPoR.HASH_TO_CURVE_DST,
+        )
+
     @classmethod
     def _label(
         cls,
@@ -99,14 +145,18 @@ class PairingPoR:
         node_id: str,
         shard_index: int,
         sector_index: int,
+        sector_size: int,
+        scheme: str,
     ) -> bytes:
         fields = (
-            cls.SCHEME.encode("ascii"),
+            scheme.encode("ascii"),
             file_id.encode("utf-8"),
             node_id.encode("utf-8"),
             shard_index.to_bytes(4, "big"),
             sector_index.to_bytes(8, "big"),
         )
+        if scheme == cls.SCHEME:
+            fields += (sector_size.to_bytes(4, "big"),)
         return b"".join(len(field).to_bytes(4, "big") + field for field in fields)
 
     @classmethod
@@ -116,20 +166,48 @@ class PairingPoR:
         node_id: str,
         shard_index: int,
         sector_index: int,
+        sector_size: int,
+        scheme: str = SCHEME,
     ):
         return hash_to_G1(
-            cls._label(file_id, node_id, shard_index, sector_index),
+            cls._label(
+                file_id,
+                node_id,
+                shard_index,
+                sector_index,
+                sector_size,
+                scheme,
+            ),
             cls.HASH_TO_CURVE_DST,
             hashlib.sha256,
         )
 
     @classmethod
-    def _sector_values(cls, sector: bytes) -> tuple[int, ...]:
-        if len(sector) != XorErasureCode.SECTOR_SIZE:
-            raise ValueError("PoR sectors must have the configured fixed size.")
+    def field_elements_for_sector_size(cls, sector_size: int) -> int:
+        if (
+            not isinstance(sector_size, int)
+            or isinstance(sector_size, bool)
+            or not XorErasureCode.MIN_SECTOR_SIZE
+            <= sector_size
+            <= XorErasureCode.MAX_SECTOR_SIZE
+        ):
+            raise ValueError("Invalid PoR sector size.")
+        return (
+            sector_size + cls.FIELD_ELEMENT_SIZE - 1
+        ) // cls.FIELD_ELEMENT_SIZE
+
+    @classmethod
+    def _sector_values(
+        cls,
+        sector: bytes,
+        sector_size: int,
+    ) -> tuple[int, ...]:
+        cls.field_elements_for_sector_size(sector_size)
+        if len(sector) != sector_size:
+            raise ValueError("PoR sector length does not match the manifest.")
         return tuple(
             int.from_bytes(sector[offset:offset + cls.FIELD_ELEMENT_SIZE], "big")
-            for offset in range(0, len(sector), cls.FIELD_ELEMENT_SIZE)
+            for offset in range(0, sector_size, cls.FIELD_ELEMENT_SIZE)
         )
 
     def file_metadata(
@@ -137,20 +215,44 @@ class PairingPoR:
         file_id: str,
         storage_size: int,
         shard_size: int,
+        sector_size: int | None = None,
     ) -> dict[str, Any]:
         """Create public parameters for a file and its 2-of-3 coded shards."""
+        sector_size = (
+            XorErasureCode.calculate_sector_size(storage_size)
+            if sector_size is None
+            else sector_size
+        )
+        field_elements_per_sector = self.field_elements_for_sector_size(sector_size)
         if (
-            not file_id
+            not isinstance(file_id, str)
+            or not file_id
+            or not isinstance(storage_size, int)
+            or isinstance(storage_size, bool)
             or storage_size < 0
-            or shard_size < 2 * XorErasureCode.SECTOR_SIZE
-            or shard_size % XorErasureCode.SECTOR_SIZE
+            or not isinstance(shard_size, int)
+            or isinstance(shard_size, bool)
+            or shard_size
+            < XorErasureCode.MIN_SECTORS_PER_SHARD * sector_size
+            or shard_size % sector_size
+            or storage_size > XorErasureCode.DATA_SHARDS * shard_size
         ):
             raise ValueError("Invalid file identifier or erasure-coded shard dimensions.")
 
         bases = []
-        for _ in range(self.FIELD_ELEMENTS_PER_SECTOR):
-            scalar = secrets.randbelow(curve_order - 1) + 1
-            bases.append(self._encode_g1(multiply(G1, scalar)))
+        if _arkworks is not None:
+            generator = self._native_g1_generator()
+            for _ in range(field_elements_per_sector):
+                scalar = secrets.randbelow(curve_order - 1) + 1
+                bases.append(
+                    (generator * _arkworks.Scalar(scalar))
+                    .to_compressed_bytes()
+                    .hex()
+                )
+        else:
+            for _ in range(field_elements_per_sector):
+                scalar = secrets.randbelow(curve_order - 1) + 1
+                bases.append(self._encode_g1(multiply(G1, scalar)))
 
         return {
             "scheme": self.SCHEME,
@@ -158,9 +260,9 @@ class PairingPoR:
             "file_id": file_id,
             "data_shards": XorErasureCode.DATA_SHARDS,
             "total_shards": XorErasureCode.TOTAL_SHARDS,
-            "sector_size": XorErasureCode.SECTOR_SIZE,
-            "sector_count_per_shard": shard_size // XorErasureCode.SECTOR_SIZE,
-            "field_elements_per_sector": self.FIELD_ELEMENTS_PER_SECTOR,
+            "sector_size": sector_size,
+            "sector_count_per_shard": shard_size // sector_size,
+            "field_elements_per_sector": field_elements_per_sector,
             "storage_size": storage_size,
             "shard_size": shard_size,
             "u_g1_hex": bases,
@@ -175,18 +277,44 @@ class PairingPoR:
         shard_data: bytes,
         public_parameters: dict[str, Any],
     ) -> list[str]:
-        """Create one node- and shard-bound authenticator per fixed sector."""
+        """Create one node- and shard-bound authenticator per file-sized sector."""
         if not node_id or not 0 <= shard_index < XorErasureCode.TOTAL_SHARDS:
             raise ValueError("PoR tags require a valid node ID and shard index.")
         sector_size = public_parameters.get("sector_size")
+        field_elements_per_sector = self.field_elements_for_sector_size(sector_size)
         encoded_bases = public_parameters.get("u_g1_hex")
         if (
-            sector_size != XorErasureCode.SECTOR_SIZE
+            public_parameters.get("scheme") != self.SCHEME
             or not isinstance(encoded_bases, list)
-            or len(encoded_bases) != self.FIELD_ELEMENTS_PER_SECTOR
+            or len(encoded_bases) != field_elements_per_sector
             or len(shard_data) % sector_size
         ):
             raise ValueError("Invalid public PoR parameters or shard data size.")
+
+        if _arkworks is not None:
+            native_bases = list(self._decode_native_bases(tuple(encoded_bases)))
+            private_scalar = _arkworks.Scalar(self._private_scalar)
+            tags = []
+            for sector_index, offset in enumerate(range(0, len(shard_data), sector_size)):
+                sector = shard_data[offset:offset + sector_size]
+                label = self._label(
+                    file_id,
+                    node_id,
+                    shard_index,
+                    sector_index,
+                    sector_size,
+                    self.SCHEME,
+                )
+                values = self._sector_values(sector, sector_size)
+                data_msm = _arkworks.G1Point.multiexp_unchecked(
+                    native_bases,
+                    [_arkworks.Scalar(value) for value in values],
+                )
+                tag_point = (
+                    self._native_hash_sector(label) + data_msm
+                ) * private_scalar
+                tags.append(tag_point.to_compressed_bytes().hex())
+            return tags
 
         bases = [self._decode_g1(point) for point in encoded_bases]
         tags = []
@@ -197,8 +325,12 @@ class PairingPoR:
                 node_id,
                 shard_index,
                 sector_index,
+                sector_size,
             )
-            for base, value in zip(bases, self._sector_values(sector)):
+            for base, value in zip(
+                bases,
+                self._sector_values(sector, sector_size),
+            ):
                 tag_point = add(tag_point, multiply(base, value))
             tags.append(self._encode_g1(multiply(tag_point, self._private_scalar)))
         return tags
@@ -207,10 +339,12 @@ class PairingPoR:
     def aggregate_response(
         cls,
         sectors: list[tuple[str, bytes, int]],
+        sector_size: int = XorErasureCode.SECTOR_SIZE,
     ) -> tuple[str, str]:
         """Aggregate stored tags and return a compact sector-linear response."""
+        field_elements_per_sector = cls.field_elements_for_sector_size(sector_size)
         aggregate_tag = Z1
-        aggregate_values = [0] * cls.FIELD_ELEMENTS_PER_SECTOR
+        aggregate_values = [0] * field_elements_per_sector
         for tag_hex, sector, coefficient in sectors:
             if not 1 <= coefficient < curve_order:
                 raise ValueError("Invalid PoR challenge coefficient.")
@@ -222,7 +356,7 @@ class PairingPoR:
                 aggregate_tag,
                 multiply(tag_point, coefficient),
             )
-            for index, value in enumerate(cls._sector_values(sector)):
+            for index, value in enumerate(cls._sector_values(sector, sector_size)):
                 aggregate_values[index] = (
                     aggregate_values[index] + coefficient * value
                 ) % curve_order
@@ -246,7 +380,8 @@ class PairingPoR:
         try:
             if (
                 not isinstance(public_parameters, dict)
-                or public_parameters.get("scheme") != cls.SCHEME
+                or public_parameters.get("scheme")
+                not in (cls.SCHEME, cls.LEGACY_SCHEME)
                 or public_parameters.get("curve") != cls.CURVE
                 or not isinstance(file_id, str)
                 or not file_id
@@ -258,10 +393,63 @@ class PairingPoR:
                 or not 0 <= shard_index < XorErasureCode.TOTAL_SHARDS
                 or not isinstance(challenges, list)
                 or not 2 <= len(challenges) <= cls.MAX_CHALLENGE_SECTORS
+                or not isinstance(public_parameters.get("sector_size"), int)
+                or isinstance(public_parameters.get("sector_size"), bool)
+                or not isinstance(
+                    public_parameters.get(
+                        "field_elements_per_sector",
+                        cls.FIELD_ELEMENTS_PER_SECTOR,
+                    ),
+                    int,
+                )
+                or isinstance(
+                    public_parameters.get(
+                        "field_elements_per_sector",
+                        cls.FIELD_ELEMENTS_PER_SECTOR,
+                    ),
+                    bool,
+                )
                 or not isinstance(mu_hex, str)
-                or len(mu_hex) != 64 * cls.FIELD_ELEMENTS_PER_SECTOR
+                or len(mu_hex)
+                != 64 * public_parameters.get(
+                    "field_elements_per_sector",
+                    cls.FIELD_ELEMENTS_PER_SECTOR,
+                )
                 or not isinstance(public_parameters.get("u_g1_hex"), list)
-                or len(public_parameters["u_g1_hex"]) != cls.FIELD_ELEMENTS_PER_SECTOR
+                or len(public_parameters["u_g1_hex"])
+                != public_parameters.get(
+                    "field_elements_per_sector",
+                    cls.FIELD_ELEMENTS_PER_SECTOR,
+                )
+            ):
+                return False
+
+            sector_size = public_parameters["sector_size"]
+            field_elements_per_sector = cls.field_elements_for_sector_size(sector_size)
+            if (
+                public_parameters.get(
+                    "field_elements_per_sector",
+                    cls.FIELD_ELEMENTS_PER_SECTOR,
+                )
+                != field_elements_per_sector
+            ):
+                return False
+            sector_count = public_parameters.get("sector_count_per_shard")
+            shard_size = public_parameters.get("shard_size")
+            storage_size = public_parameters.get("storage_size")
+            if (
+                not isinstance(sector_count, int)
+                or isinstance(sector_count, bool)
+                or sector_count < XorErasureCode.MIN_SECTORS_PER_SHARD
+                or not isinstance(shard_size, int)
+                or isinstance(shard_size, bool)
+                or shard_size != sector_count * sector_size
+                or not isinstance(storage_size, int)
+                or isinstance(storage_size, bool)
+                or storage_size < 0
+                or storage_size > XorErasureCode.DATA_SHARDS * shard_size
+                or public_parameters.get("data_shards") != XorErasureCode.DATA_SHARDS
+                or public_parameters.get("total_shards") != XorErasureCode.TOTAL_SHARDS
             ):
                 return False
 
@@ -298,7 +486,14 @@ class PairingPoR:
                 expected = add(
                     expected,
                     multiply(
-                        cls._hash_sector(file_id, node_id, shard_index, index),
+                        cls._hash_sector(
+                            file_id,
+                            node_id,
+                            shard_index,
+                            index,
+                            sector_size,
+                            public_parameters["scheme"],
+                        ),
                         coefficient,
                     ),
                 )
