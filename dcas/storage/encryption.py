@@ -9,6 +9,8 @@ import os
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from .key_security import secure_new_private_file, secure_private_file
+
 
 class StorageEncryptionError(ValueError):
     """Raised when a stored-data envelope is malformed or cannot be authenticated."""
@@ -63,10 +65,12 @@ class StorageEncryptor:
                 0o600,
             )
         except FileExistsError:
+            secure_private_file(key_path)
             with open(key_path, "rb") as key_file:
                 key = key_file.read()
         else:
             key = os.urandom(cls.KEY_SIZE)
+            secure_new_private_file(key_path, descriptor)
             with os.fdopen(descriptor, "wb") as key_file:
                 key_file.write(key)
                 key_file.flush()

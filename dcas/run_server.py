@@ -15,8 +15,10 @@ Otherwise, the server uses the SQLite database selected by --db.
 New API uploads use the educational pairing PoR layout and require at least
 three storage nodes. The API creates PoR and storage-encryption keys in the
 network directory. Set DCAS_POR_PRIVATE_KEY_FILE and DCAS_STORAGE_KEY_FILE to
-use protected key files at other paths. Remote node services require the same
-DCAS_NODE_AUTH_TOKEN in the API and node process; use at least 32 characters.
+use protected key files at other paths. Key files are access-restricted but
+remain unencrypted at rest; back them up only to an encrypted, protected
+location. Remote node services require the same DCAS_NODE_AUTH_TOKEN in the
+API and node process; use at least 32 characters.
 """
 
 import argparse

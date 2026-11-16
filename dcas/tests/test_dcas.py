@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -902,6 +903,32 @@ class TestStoragePDP(unittest.TestCase):
         reloaded = StoragePDP.from_config(self.test_dir)
         self.assertEqual(reloaded.public_parameters, self.pdp.public_parameters)
 
+    @unittest.skipIf(os.name == "nt", "Windows ACLs use icacls rather than POSIX mode bits")
+    def test_existing_signing_key_permissions_are_restricted_on_load(self):
+        key_path = os.path.join(self.test_dir, ".dcas-pdp-private-key.pem")
+        os.chmod(key_path, 0o644)
+
+        StoragePDP.from_config(self.test_dir)
+
+        self.assertEqual(os.stat(key_path).st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL regression test")
+    def test_existing_signing_key_acl_removes_other_users(self):
+        key_path = os.path.join(self.test_dir, ".dcas-pdp-private-key.pem")
+        subprocess.run(["icacls", key_path, "/grant", "*S-1-1-0:(R)"], check=True)
+
+        StoragePDP.from_config(self.test_dir)
+
+        acl = subprocess.run(
+            ["icacls", key_path],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertIn("NT AUTHORITY\\SYSTEM:(F)", acl)
+        self.assertNotIn("*S-1-1-0", acl)
+        self.assertNotIn("(I)", acl)
+
 
 class TestPairingPoR(unittest.TestCase):
     """Tests the educational pairing PoR and 2-of-3 coded storage path."""
@@ -932,6 +959,21 @@ class TestPairingPoR(unittest.TestCase):
             first_metadata["public_key_g2_hex"],
             second_metadata["public_key_g2_hex"],
         )
+
+    @unittest.skipIf(os.name == "nt", "Windows ACLs use icacls rather than POSIX mode bits")
+    def test_existing_por_and_encryption_keys_are_restricted_on_load(self):
+        por_path = os.path.join(self.test_dir, ".dcas-por-private-key.hex")
+        storage_path = os.path.join(self.test_dir, ".dcas-storage-key")
+        PairingPoR.from_config(self.test_dir)
+        StorageEncryptor.from_config(self.test_dir)
+        os.chmod(por_path, 0o644)
+        os.chmod(storage_path, 0o644)
+
+        PairingPoR.from_config(self.test_dir)
+        StorageEncryptor.from_config(self.test_dir)
+
+        self.assertEqual(os.stat(por_path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(storage_path).st_mode & 0o777, 0o600)
 
     def test_xor_code_reconstructs_from_every_pair(self):
         original = bytes(range(251)) * 3

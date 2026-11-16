@@ -14,6 +14,8 @@ from typing import Any
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from .key_security import secure_new_private_file, secure_private_file
+
 
 class StoragePDP:
     """Create homomorphic RSA tags and verify aggregate storage proofs."""
@@ -47,6 +49,9 @@ class StoragePDP:
         os.makedirs(os.path.dirname(key_path), exist_ok=True)
 
         try:
+            if not os.path.exists(key_path):
+                raise FileNotFoundError(key_path)
+            secure_private_file(key_path)
             with open(key_path, "rb") as key_file:
                 key_data = key_file.read()
         except FileNotFoundError:
@@ -66,9 +71,11 @@ class StoragePDP:
                     0o600,
                 )
             except FileExistsError:
+                secure_private_file(key_path)
                 with open(key_path, "rb") as key_file:
                     key_data = key_file.read()
             else:
+                secure_new_private_file(key_path, descriptor)
                 with os.fdopen(descriptor, "wb") as key_file:
                     key_file.write(key_data)
                     key_file.flush()

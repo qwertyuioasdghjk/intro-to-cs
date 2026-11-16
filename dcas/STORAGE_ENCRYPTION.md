@@ -19,7 +19,7 @@ The second layer means a writer who bypasses the browser and submits plaintext (
 
 ## Storage key
 
-For local development, the API creates a random 32-byte key at `.dcas-storage-key` inside the configured network directory. Keep this file private and preserve it with the stored data. Losing or replacing it makes API-uploaded files unreadable.
+For local development, the API creates a random 32-byte key at `.dcas-storage-key` inside the configured network directory. Key-file permissions are restricted to the service account (POSIX mode `0600`; Windows inherited ACLs removed and access granted to the current account and `SYSTEM`). This does not encrypt the key at rest. Keep it private and preserve it in a protected, encrypted backup; losing or replacing it makes API-uploaded files unreadable.
 
 For deployment, set `DCAS_STORAGE_ENCRYPTION_KEY` to a stable URL-safe base64 encoding of a random 32-byte key, or set `DCAS_STORAGE_KEY_FILE` to a protected persistent key-file path. Do not commit the key or expose it to storage-node operators. Back it up securely.
 

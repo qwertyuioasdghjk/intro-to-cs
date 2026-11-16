@@ -16,6 +16,7 @@ from py_ecc.bls.hash_to_curve import hash_to_G1
 from py_ecc.optimized_bls12_381 import G1, G2, Z1, add, curve_order, multiply, pairing
 
 from .erasure import XorErasureCode
+from .key_security import secure_new_private_file, secure_private_file
 
 
 class PairingPoR:
@@ -44,6 +45,9 @@ class PairingPoR:
         os.makedirs(os.path.dirname(key_path), exist_ok=True)
 
         try:
+            if not os.path.exists(key_path):
+                raise FileNotFoundError(key_path)
+            secure_private_file(key_path)
             with open(key_path, "r", encoding="ascii") as key_file:
                 encoded_key = key_file.read().strip()
         except FileNotFoundError:
@@ -56,9 +60,11 @@ class PairingPoR:
                     0o600,
                 )
             except FileExistsError:
+                secure_private_file(key_path)
                 with open(key_path, "r", encoding="ascii") as key_file:
                     encoded_key = key_file.read().strip()
             else:
+                secure_new_private_file(key_path, descriptor)
                 with os.fdopen(descriptor, "w", encoding="ascii") as key_file:
                     key_file.write(encoded_key)
                     key_file.flush()

@@ -66,9 +66,18 @@ Keep node services private.
 
 The API creates a PoR private key at `.dcas-por-private-key.hex` inside the
 configured network directory. Set `DCAS_POR_PRIVATE_KEY_FILE` to use another
-path. Protect and back up this key; the manifest contains public verification
-parameters, but losing the private key prevents consistent future tagging.
-Never commit the key to source control.
+path. On POSIX, the API restricts key-file permissions to the service account
+(mode `0600`). On Windows, it removes inherited permissions and grants access
+to the current account and `SYSTEM`. Existing key files have their permissions
+tightened when loaded. These controls limit access by other local accounts but
+do not encrypt the key at rest or protect against an administrator or a
+compromised service account.
+
+Back up this key only to a protected, encrypted backup location and test
+restoration; losing it prevents consistent future tagging. Never commit it or
+place an unprotected backup alongside the data. Use an HSM or KMS in production.
+The legacy RSA-PDP key (`.dcas-pdp-private-key.pem`) receives the same file
+permission protections.
 
 The PoR tagger covers the API's encrypted storage envelope, not plaintext
 uploads. The API still receives normal uploads in plaintext and holds the
