@@ -1465,6 +1465,13 @@ class TestMetadataStore(unittest.TestCase):
         self.assertTrue(self.db.delete_file(cid_str))
         self.assertIsNone(self.db.get_manifest(cid_str))
 
+    def test_delete_shared_space(self):
+        self.db.create_shared_space("space-1", "Space", "admin-hash", "share-hash")
+
+        self.assertTrue(self.db.delete_shared_space("space-1"))
+        self.assertFalse(self.db.delete_shared_space("space-1"))
+        self.assertIsNone(self.db.get_shared_space("space-1"))
+
     def test_audit_log(self):
         """Audit log records events."""
         self.db.log_event("TEST_EVENT", "cid-123", "test.txt", "Test detail")

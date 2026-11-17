@@ -61,7 +61,13 @@ class MongoMetadataStore:
             upsert=True,
         )
         stored = self.files.find_one({"cid": cid}, {"_id": 1})
-        self.log_event("UPLOAD", cid, manifest["filename"], "File stored successfully")
+        if space_id is None:
+            self.log_event("UPLOAD", cid, manifest["filename"], "File stored successfully")
+        else:
+            self.log_event(
+                "UPLOAD",
+                details="Encrypted file stored in shared space",
+            )
         return str(stored["_id"])
 
     def get_manifest(self, cid: str) -> Optional[dict]:
@@ -89,9 +95,7 @@ class MongoMetadataStore:
             return False
         self.log_event(
             "STORAGE_ENCRYPTION_MIGRATION",
-            cid,
-            manifest["filename"],
-            "Shared file migrated to encrypted storage",
+            details="Encrypted shared-space file migrated",
         )
         return True
 
@@ -162,6 +166,10 @@ class MongoMetadataStore:
         )
         return result.matched_count > 0
 
+    def delete_shared_space(self, space_id: str) -> bool:
+        result = self.shared_spaces.delete_one({"space_id": space_id})
+        return result.deleted_count > 0
+
     def get_private_cids(self) -> set[str]:
         return {
             document["cid"]
@@ -172,9 +180,26 @@ class MongoMetadataStore:
         }
 
     def delete_file(self, cid: str) -> bool:
+        file_info = self.get_file_info(cid)
+        is_private = bool(file_info and file_info.get("space_id"))
+        if is_private:
+            self.audit_log.update_many(
+                {"cid": cid},
+                {"$set": {
+                    "cid": None,
+                    "filename": None,
+                    "details": "Private shared-space activity",
+                }},
+            )
         result = self.files.delete_one({"cid": cid})
         if result.deleted_count:
-            self.log_event("DELETE", cid, details="File metadata deleted")
+            if is_private:
+                self.log_event(
+                    "DELETE",
+                    details="Encrypted file deleted from shared space",
+                )
+            else:
+                self.log_event("DELETE", cid, details="File metadata deleted")
             return True
         return False
 

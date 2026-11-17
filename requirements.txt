@@ -1,4 +1,5 @@
 Flask>=3,<4
+waitress>=3,<4
 rich>=13,<15
 pymongo>=4.6,<5
 cryptography>=42,<48

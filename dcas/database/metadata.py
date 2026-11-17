@@ -27,6 +27,9 @@ class MetadataStore:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA busy_timeout=5000;")
         self._create_tables()
 
     def _create_tables(self):
@@ -159,7 +162,13 @@ class MetadataStore:
         )
         self.conn.commit()
 
-        self.log_event("UPLOAD", cid_str, manifest["filename"], "File stored successfully")
+        if space_id is None:
+            self.log_event("UPLOAD", cid_str, manifest["filename"], "File stored successfully")
+        else:
+            self.log_event(
+                "UPLOAD",
+                details="Encrypted file stored in shared space",
+            )
         return cursor.lastrowid
 
     def get_manifest(self, cid: str) -> Optional[dict]:
@@ -199,9 +208,7 @@ class MetadataStore:
             return False
         self.log_event(
             "STORAGE_ENCRYPTION_MIGRATION",
-            cid,
-            manifest["filename"],
-            "Shared file migrated to encrypted storage",
+            details="Encrypted shared-space file migrated",
         )
         return True
 
@@ -286,6 +293,14 @@ class MetadataStore:
         self.conn.commit()
         return cursor.rowcount > 0
 
+    def delete_shared_space(self, space_id: str) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM shared_spaces WHERE space_id = ?",
+            (space_id,),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     def get_private_cids(self) -> set[str]:
         rows = self.conn.execute(
             "SELECT cid FROM files WHERE space_id IS NOT NULL"
@@ -294,11 +309,30 @@ class MetadataStore:
 
     def delete_file(self, cid: str) -> bool:
         """Delete a file's metadata by CID."""
+        file_info = self.get_file_info(cid)
+        is_private = bool(file_info and file_info.get("space_id"))
+        if is_private:
+            self.conn.execute(
+                """
+                UPDATE audit_log
+                SET cid = NULL, filename = NULL, details = ?
+                WHERE cid = ?
+                """,
+                ("Private shared-space activity", cid),
+            )
+            self.conn.commit()
+
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM files WHERE cid = ?", (cid,))
         self.conn.commit()
         if cursor.rowcount > 0:
-            self.log_event("DELETE", cid, details="File metadata deleted")
+            if is_private:
+                self.log_event(
+                    "DELETE",
+                    details="Encrypted file deleted from shared space",
+                )
+            else:
+                self.log_event("DELETE", cid, details="File metadata deleted")
             return True
         return False
 

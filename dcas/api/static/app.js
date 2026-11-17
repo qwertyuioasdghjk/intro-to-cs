@@ -6,10 +6,19 @@ const nodeGrid = $("#node-grid");
 const activityList = $("#activity-list");
 const fileDialog = $("#file-dialog");
 const toastRegion = $("#toast-region");
+const ADMIN_SESSION_KEY = "dcas.admin-token";
 let allFiles = [];
 let selectedFile = null;
 let refreshInProgress = false;
 let activeSharedAccess = null;
+let adminAuthorized = false;
+let adminConfigured = false;
+let chaosEnabled = false;
+let networkStatus = null;
+let dashboardLoaded = false;
+let ownedSpacesLoaded = false;
+const MAX_UPLOAD_BYTES = Number(document.querySelector('meta[name="dcas-max-upload-bytes"]')?.content) || 25 * 1024 * 1024;
+const ACCESS_TOKEN_REQUIRED = document.querySelector('meta[name="dcas-access-token-required"]')?.content === "true";
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
@@ -60,6 +69,96 @@ function showToast(message, isError = false) {
   window.setTimeout(() => toast.remove(), 4200);
 }
 
+function promptForAccessToken(message) {
+  let token = window.sessionStorage.getItem("dcas.access-token");
+  if (!token) {
+    token = window.prompt(message)?.trim() || "";
+    if (token) window.sessionStorage.setItem("dcas.access-token", token);
+  }
+  if (!token) throw new Error("An authorization token is required for this action.");
+  return token;
+}
+
+function adminHeaders() {
+  const token = window.sessionStorage.getItem(ADMIN_SESSION_KEY);
+  if (!token || !adminAuthorized) throw new Error("Unlock Admin Mode to perform this action.");
+  return { "X-Admin-Token": token };
+}
+
+function accessHeaders() {
+  if (!ACCESS_TOKEN_REQUIRED) return {};
+  return { "X-Access-Token": promptForAccessToken("Enter the DCAS access token.") };
+}
+
+function renderAdminState() {
+  const toggle = $("#admin-mode-toggle");
+  toggle.textContent = adminAuthorized ? "Admin: Active" : "Admin: Locked";
+  toggle.setAttribute("aria-pressed", String(adminAuthorized));
+  toggle.title = adminAuthorized ? "Open admin session controls" : "Unlock Admin Mode";
+  toggle.classList.toggle("active", adminAuthorized);
+  $("#admin-unlock-form").classList.toggle("hidden", adminAuthorized);
+  $("#admin-active-actions").classList.toggle("hidden", !adminAuthorized);
+
+  if (dashboardLoaded) {
+    renderFiles();
+    if (networkStatus) renderNetwork(networkStatus);
+  }
+  if (ownedSpacesLoaded) renderOwnedSpaces();
+  renderCorruptChunkActions();
+}
+
+async function validateAdminToken(token, showError = false) {
+  const headers = token ? { "X-Admin-Token": token } : {};
+  const status = await api("/api/admin/status", { headers });
+  adminConfigured = Boolean(status.admin_configured);
+  chaosEnabled = Boolean(status.chaos_enabled);
+  adminAuthorized = Boolean(token && status.authorized);
+
+  const errorOutput = $("#admin-error");
+  if (adminAuthorized) {
+    window.sessionStorage.setItem(ADMIN_SESSION_KEY, token);
+    errorOutput.textContent = "";
+  } else {
+    window.sessionStorage.removeItem(ADMIN_SESSION_KEY);
+    if (showError) {
+      errorOutput.textContent = !adminConfigured
+        ? "Server admin token is not configured."
+        : token
+          ? "Invalid admin token."
+          : "Enter the admin token.";
+    }
+  }
+  renderAdminState();
+  return adminAuthorized;
+}
+
+async function initializeAdminMode() {
+  const token = window.sessionStorage.getItem(ADMIN_SESSION_KEY);
+  try {
+    await validateAdminToken(token, Boolean(token));
+  } catch (error) {
+    window.sessionStorage.removeItem(ADMIN_SESSION_KEY);
+    adminAuthorized = false;
+    renderAdminState();
+    if (token) $("#admin-error").textContent = `Could not verify admin access: ${error.message}`;
+  }
+}
+
+function lockAdminMode() {
+  window.sessionStorage.removeItem(ADMIN_SESSION_KEY);
+  adminAuthorized = false;
+  $("#admin-error").textContent = "";
+  $("#admin-token-input").value = "";
+  renderAdminState();
+  $("#admin-dialog").close();
+}
+
+function fileWithinUploadLimit(file) {
+  if (file.size <= MAX_UPLOAD_BYTES) return true;
+  showToast(`This file is larger than the ${formatBytes(MAX_UPLOAD_BYTES)} upload limit.`, true);
+  return false;
+}
+
 function setLoading(button, loading, label) {
   if (loading) {
     button.dataset.originalLabel = button.textContent;
@@ -81,7 +180,7 @@ function renderFiles(files = allFiles) {
 
   if (!visibleFiles.length) {
     const row = node("tr");
-    const cell = node("td", "table-message", query ? "No files match your search." : "No files stored yet. Upload a file to get started.");
+    const cell = node("td", "table-message", query ? "No files match your search." : "No public files stored yet. Upload a file to get started.");
     cell.colSpan = 5;
     row.append(cell);
     filesBody.append(row);
@@ -113,13 +212,16 @@ function renderFiles(files = allFiles) {
       action.setAttribute("aria-label", `View ${file.filename || "file"} details`);
       action.title = "View details and verify";
       action.addEventListener("click", () => openFile(file));
-      const deleteButton = node("button", "row-action row-action-delete", "Delete");
-      deleteButton.type = "button";
-      deleteButton.setAttribute("aria-label", `Delete ${file.filename || "file"}`);
-      deleteButton.title = "Delete file";
-      deleteButton.addEventListener("click", () => deleteFile(file));
       const rowActions = node("div", "file-row-actions");
-      rowActions.append(action, deleteButton);
+      rowActions.append(action);
+      if (adminAuthorized) {
+        const deleteButton = node("button", "row-action row-action-delete", "Delete");
+        deleteButton.type = "button";
+        deleteButton.setAttribute("aria-label", `Delete ${file.filename || "file"}`);
+        deleteButton.title = "Delete file";
+        deleteButton.addEventListener("click", () => deleteFile(file));
+        rowActions.append(deleteButton);
+      }
       actionsCell.append(rowActions);
       row.append(fileCell, sizeCell, ownerCell, dateCell, actionsCell);
       filesBody.append(row);
@@ -128,7 +230,7 @@ function renderFiles(files = allFiles) {
 
   $("#files-summary").textContent = query
     ? `Showing ${visibleFiles.length} of ${allFiles.length} files`
-    : `${allFiles.length} ${allFiles.length === 1 ? "file" : "files"} in your library`;
+    : `${allFiles.length} ${allFiles.length === 1 ? "file" : "files"} in public library`;
   $("#clear-search").classList.toggle("hidden", !query);
 }
 
@@ -168,11 +270,31 @@ function renderNetwork(status) {
       node("strong", "", item.node_id),
       node("span", "", `${onlineNode ? "Online" : "Offline"} · ${item.chunk_count} ${item.chunk_count === 1 ? "chunk" : "chunks"} · ${formatBytes(item.used_space_bytes)}`)
     );
-    const control = node("button", `node-control${onlineNode ? "" : " recover"}`, onlineNode ? "Take offline" : "Recover");
-    control.type = "button";
-    control.addEventListener("click", () => changeNodeState(item.node_id, onlineNode, control));
-    card.append(symbol, info, control);
+    card.append(symbol, info);
+    if (adminAuthorized && chaosEnabled) {
+      const control = node("button", `node-control${onlineNode ? "" : " recover"}`, onlineNode ? "Fail Node" : "Recover Node");
+      control.type = "button";
+      control.addEventListener("click", () => changeNodeState(item.node_id, onlineNode, control));
+      card.append(control);
+    }
     nodeGrid.append(card);
+  }
+}
+
+function renderCorruptChunkActions() {
+  const actions = $("#chaos-actions");
+  actions.replaceChildren();
+  const chunkCount = Number(selectedFile?.chunk_count) || 0;
+  if (!adminAuthorized || !chaosEnabled || !selectedFile?.cid || !chunkCount) {
+    actions.classList.add("hidden");
+    return;
+  }
+  actions.classList.remove("hidden");
+  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+    const button = node("button", "button button-danger", `Corrupt Chunk ${chunkIndex}`);
+    button.type = "button";
+    button.addEventListener("click", () => corruptChunk(chunkIndex, button));
+    actions.append(button);
   }
 }
 
@@ -210,6 +332,8 @@ async function loadDashboard() {
       api("/api/audit-log?limit=8")
     ]);
     allFiles = Array.isArray(fileData.files) ? fileData.files : [];
+    networkStatus = networkData;
+    dashboardLoaded = true;
     renderFiles();
     renderNetwork(networkData);
     $("#stat-files").textContent = String(fileData.count ?? allFiles.length);
@@ -217,7 +341,7 @@ async function loadDashboard() {
     renderActivity(Array.isArray(auditData.logs) ? auditData.logs : []);
   } catch (error) {
     showToast(`Could not load dashboard: ${error.message}`, true);
-    $("#files-summary").textContent = "Could not load file library";
+    $("#files-summary").textContent = "Could not load public library";
     nodeGrid.replaceChildren(node("div", "empty-state", "Could not load storage node status."));
     activityList.replaceChildren(node("div", "empty-state", "Could not load audit history."));
   } finally {
@@ -233,6 +357,7 @@ function updateSelectedFile(file) {
 
 async function openFile(file) {
   selectedFile = file;
+  renderCorruptChunkActions();
   $("#dialog-title").textContent = file.filename || "File details";
   $("#verify-output").replaceChildren();
   $("#file-details").replaceChildren(node("div", "empty-state", "Loading file details…"));
@@ -241,6 +366,7 @@ async function openFile(file) {
   try {
     const info = await api(`/api/file/${encodeURIComponent(file.cid)}`);
     selectedFile = { ...file, ...info };
+    renderCorruptChunkActions();
     const details = $("#file-details");
     details.replaceChildren();
     const fields = [
@@ -306,13 +432,33 @@ async function changeNodeState(nodeId, isOnline, button) {
   setLoading(button, true, "Updating…");
   try {
     const action = isOnline ? "fail" : "recover";
-    const result = await api(`/api/network/${action}/${encodeURIComponent(nodeId)}`, { method: "POST" });
+    const result = await api(`/api/network/${action}/${encodeURIComponent(nodeId)}`, {
+      method: "POST",
+      headers: adminHeaders()
+    });
     showToast(result.message || `${nodeId} updated.`);
     await loadDashboard();
   } catch (error) {
     showToast(`Could not update ${nodeId}: ${error.message}`, true);
   } finally {
-    setLoading(button, false, isOnline ? "Take offline" : "Recover");
+    setLoading(button, false, isOnline ? "Fail Node" : "Recover Node");
+  }
+}
+
+async function corruptChunk(chunkIndex, button) {
+  if (!selectedFile?.cid) return;
+  setLoading(button, true, "Corrupting…");
+  try {
+    const result = await api(
+      `/api/simulate/corrupt/${encodeURIComponent(selectedFile.cid)}/${chunkIndex}`,
+      { method: "POST", headers: adminHeaders() }
+    );
+    showToast(result.message || `Chunk ${chunkIndex} corrupted.`);
+    await loadDashboard();
+  } catch (error) {
+    showToast(`Could not corrupt chunk ${chunkIndex}: ${error.message}`, true);
+  } finally {
+    setLoading(button, false, `Corrupt Chunk ${chunkIndex}`);
   }
 }
 
@@ -321,7 +467,10 @@ async function deleteFile(file) {
   if (!window.confirm(`Delete "${filename}" from the network? This cannot be undone.`)) return;
 
   try {
-    const result = await api(`/api/file/${encodeURIComponent(file.cid)}`, { method: "DELETE" });
+    const result = await api(`/api/file/${encodeURIComponent(file.cid)}`, {
+      method: "DELETE",
+      headers: adminHeaders()
+    });
     if (selectedFile?.cid === file.cid && fileDialog.open) fileDialog.close();
     showToast(result.message || `${filename} deleted.`);
     await loadDashboard();
@@ -417,6 +566,12 @@ function renderOwnedSpaces() {
     revokeButton.disabled = !space.share_token;
     revokeButton.addEventListener("click", () => revokeSpaceLink(space.space_id));
     actions.append(copyButton, rotateButton, revokeButton);
+    if (space.admin_token || adminAuthorized) {
+      const deleteButton = node("button", "button button-danger", "Delete space");
+      deleteButton.type = "button";
+      deleteButton.addEventListener("click", () => deleteSharedSpace(space.space_id));
+      actions.append(deleteButton);
+    }
     card.append(info, actions);
     spacesList.append(card);
 
@@ -467,6 +622,29 @@ async function revokeSpaceLink(spaceId) {
   }
 }
 
+async function deleteSharedSpace(spaceId) {
+  const spaces = readOwnedSpaces();
+  const space = spaces.find((item) => item.space_id === spaceId);
+  if (!space) return;
+  if (!window.confirm(`Delete "${space.name}" and all of its files? This cannot be undone.`)) return;
+
+  try {
+    const headers = space.admin_token
+      ? { Authorization: `Bearer ${space.admin_token}` }
+      : adminHeaders();
+    const result = await api(`/api/spaces/${encodeURIComponent(spaceId)}`, {
+      method: "DELETE",
+      headers
+    });
+    saveOwnedSpaces(spaces.filter((item) => item.space_id !== spaceId));
+    renderOwnedSpaces();
+    await loadDashboard();
+    showToast(`Shared space deleted with ${result.deleted_files} ${result.deleted_files === 1 ? "file" : "files"}.`);
+  } catch (error) {
+    showToast(`Could not delete the shared space: ${error.message}`, true);
+  }
+}
+
 async function createSharedSpace(event) {
   event.preventDefault();
   const nameInput = $("#space-name");
@@ -479,7 +657,7 @@ async function createSharedSpace(event) {
   try {
     const result = await api("/api/spaces", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...accessHeaders() },
       body: JSON.stringify({
         name: nameInput.value.trim(),
         allow_upload: $("#space-permission").value === "read_write"
@@ -514,6 +692,7 @@ async function uploadToSharedSpace(event) {
     showToast("Choose a shared space and a file first.", true);
     return;
   }
+  if (!fileWithinUploadLimit(file)) return;
   if (!window.crypto?.subtle) {
     showToast("Browser encryption requires HTTPS or localhost and Web Crypto support.", true);
     return;
@@ -670,6 +849,7 @@ async function uploadToSharedSpaceFromLink(event) {
     showToast("Choose a file to upload.", true);
     return;
   }
+  if (!fileWithinUploadLimit(file)) return;
   if (!window.crypto?.subtle) {
     showToast("Browser encryption requires HTTPS or localhost and Web Crypto support.", true);
     return;
@@ -778,6 +958,7 @@ $("#upload-form").addEventListener("submit", async (event) => {
     showToast("Choose a file before uploading.", true);
     return;
   }
+  if (!fileWithinUploadLimit(file)) return;
   const button = $("#upload-submit");
   setLoading(button, true, "Distributing file…");
   try {
@@ -785,7 +966,7 @@ $("#upload-form").addEventListener("submit", async (event) => {
     formData.append("file", file, file.name);
     formData.append("owner", $("#owner-input").value.trim() || "system");
     formData.append("tags", JSON.stringify($("#tags-input").value.split(",").map((tag) => tag.trim()).filter(Boolean)));
-    const result = await api("/api/upload", { method: "POST", body: formData });
+    const result = await api("/api/upload", { method: "POST", headers: accessHeaders(), body: formData });
     showToast(`${result.filename} stored successfully. CID: ${result.cid}`);
     event.target.reset();
     $("#owner-input").value = "system";
@@ -815,7 +996,7 @@ $("#text-form").addEventListener("submit", async (event) => {
   try {
     const result = await api("/api/upload/text", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...accessHeaders() },
       body: JSON.stringify({
         content,
         filename: $("#text-filename").value.trim() || "note.txt",
@@ -839,6 +1020,36 @@ $("#clear-search").addEventListener("click", (event) => {
   renderFiles();
 });
 $("#refresh-button").addEventListener("click", () => loadDashboard());
+const adminDialog = $("#admin-dialog");
+$("#admin-mode-toggle").addEventListener("click", () => {
+  $("#admin-token-input").value = "";
+  renderAdminState();
+  adminDialog.showModal();
+  if (!adminAuthorized) $("#admin-token-input").focus();
+});
+$("#admin-unlock-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const token = $("#admin-token-input").value.trim();
+  const unlockButton = $("#admin-unlock-button");
+  setLoading(unlockButton, true, "Checking…");
+  $("#admin-error").textContent = "";
+  try {
+    if (await validateAdminToken(token, true)) {
+      $("#admin-token-input").value = "";
+      adminDialog.close();
+    }
+  } catch (error) {
+    window.sessionStorage.removeItem(ADMIN_SESSION_KEY);
+    adminAuthorized = false;
+    renderAdminState();
+    $("#admin-error").textContent = `Could not verify admin access: ${error.message}`;
+  } finally {
+    setLoading(unlockButton, false, "Unlock");
+  }
+});
+$("#admin-cancel-button").addEventListener("click", () => adminDialog.close());
+$("#admin-active-cancel-button").addEventListener("click", () => adminDialog.close());
+$("#admin-lock-button").addEventListener("click", lockAdminMode);
 $(".close-dialog").addEventListener("click", () => fileDialog.close());
 fileDialog.addEventListener("click", (event) => {
   if (event.target === fileDialog) fileDialog.close();
@@ -852,7 +1063,8 @@ document.querySelectorAll(".nav-link").forEach((link) => {
   link.addEventListener("click", () => {
     document.querySelectorAll(".nav-link").forEach((item) => item.classList.remove("active"));
     link.classList.add("active");
-    $("#current-section").textContent = link.textContent.trim();
+    const icon = link.querySelector(".nav-icon");
+    $("#current-section").textContent = link.textContent.replace(icon?.textContent || "", "").trim();
   });
 });
 
@@ -865,6 +1077,9 @@ if (window.location.pathname.startsWith("/share/")) {
   openSharedSpace();
 } else {
   renderOwnedSpaces();
-  loadDashboard();
-  window.setInterval(loadDashboard, 30000);
+  ownedSpacesLoaded = true;
+  initializeAdminMode().finally(() => {
+    loadDashboard();
+    window.setInterval(loadDashboard, 30000);
+  });
 }

@@ -10,6 +10,7 @@ Endpoints:
     POST   /api/spaces/<id>/files/<cid>/verify  Verify a shared-space file
     POST   /api/spaces/<id>/link/rotate Replace the read-only access link
     DELETE /api/spaces/<id>/link        Revoke the read-only access link
+    DELETE /api/spaces/<id>             Delete a shared space and its files
     GET    /api/files           List stored files
     GET    /api/file/<cid>      Get file info
     GET    /api/download/<cid>  Download a file
@@ -31,11 +32,17 @@ import os
 import json
 import secrets
 import hmac
+import ipaddress
 import sqlite3
+import threading
 import tempfile
+import time
+from collections import defaultdict
+from functools import wraps
 
 from flask import Flask, jsonify, render_template, request, send_file
 from pymongo.errors import PyMongoError
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from ..storage.network import StorageNetwork
 from ..verifier.verifier import IntegrityVerifier
@@ -72,11 +79,183 @@ def create_app(
     """
     app = Flask(__name__)
 
+    def integer_setting(name: str, default: int, *, allow_zero: bool = False) -> int:
+        raw_value = os.environ.get(name)
+        try:
+            value = default if raw_value is None else int(raw_value)
+        except ValueError as error:
+            raise ValueError(f"{name} must be an integer.") from error
+        if value < 0 or (value == 0 and not allow_zero):
+            qualifier = "non-negative" if allow_zero else "positive"
+            raise ValueError(f"{name} must be {qualifier}.")
+        return value
+
+    app.config["MAX_CONTENT_LENGTH"] = (
+        integer_setting("DCAS_MAX_UPLOAD_MB", 25) * 1024 * 1024
+    )
+    app.config["DCAS_MAX_STORAGE_BYTES"] = (
+        integer_setting("DCAS_MAX_STORAGE_MB", 1024) * 1024 * 1024
+    )
+    app.config["DCAS_ENABLE_RATE_LIMIT"] = (
+        os.environ.get("DCAS_ENABLE_RATE_LIMIT", "1") == "1"
+    )
+    app.config["DCAS_TRUST_PROXY"] = os.environ.get("DCAS_TRUST_PROXY", "0") == "1"
+    app.config["DCAS_ADMIN_RATE_LIMIT"] = integer_setting(
+        "DCAS_ADMIN_RATE_LIMIT", 10
+    )
+    app.config["DCAS_WRITE_RATE_LIMIT"] = integer_setting(
+        "DCAS_WRITE_RATE_LIMIT", 30
+    )
+    app.config["DCAS_RATE_LIMIT_LOCALHOST"] = (
+        os.environ.get("DCAS_RATE_LIMIT_LOCALHOST", "1") != "0"
+    )
+    app.config["DCAS_ADMIN_TOKEN"] = os.environ.get("DCAS_ADMIN_TOKEN", "")
+    app.config["DCAS_APP_TOKEN"] = os.environ.get("DCAS_APP_TOKEN", "")
+    app.config["DCAS_APP_RATE_LIMIT"] = integer_setting(
+        "DCAS_APP_RATE_LIMIT", 10
+    )
+    app.config["DCAS_ACCESS_TOKEN"] = os.environ.get("DCAS_ACCESS_TOKEN", "")
+    app.config["DCAS_ENABLE_CHAOS"] = os.environ.get("DCAS_ENABLE_CHAOS") == "1"
+    app.config["DCAS_GLOBAL_STORAGE_QUOTA_BYTES"] = integer_setting(
+        "DCAS_GLOBAL_STORAGE_QUOTA_BYTES", 0, allow_zero=True
+    )
+    app.config["DCAS_SPACE_STORAGE_QUOTA_BYTES"] = integer_setting(
+        "DCAS_SPACE_STORAGE_QUOTA_BYTES", 0, allow_zero=True
+    )
+    app.config["DCAS_RATE_LIMIT_WINDOW_SECONDS"] = integer_setting(
+        "DCAS_RATE_LIMIT_WINDOW_SECONDS", 60
+    )
+    app.config["DCAS_RATE_LIMITS"] = {
+        "audit": integer_setting("DCAS_RATE_LIMIT_AUDIT", 30),
+        "challenge": integer_setting("DCAS_RATE_LIMIT_CHALLENGE", 60),
+    }
+
+    rate_buckets: defaultdict[tuple[str, str], list[float]] = defaultdict(list)
+    rate_limit_lock = threading.Lock()
+    quota_lock = threading.Lock()
+    app.extensions["dcas_rate_limit_buckets"] = rate_buckets
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_payload_too_large(_error):
+        return jsonify({"error": "File exceeds maximum upload size"}), 413
+
+    @app.before_request
+    def enforce_rate_limits():
+        if not app.config["DCAS_ENABLE_RATE_LIMIT"]:
+            return None
+
+        app_token = app.config["DCAS_APP_TOKEN"]
+        supplied_app_token = request.headers.get("X-App-Token", "")
+        app_token_authorized = not app_token or hmac.compare_digest(
+            supplied_app_token, app_token
+        )
+        requires_app_token = (
+            request.path.startswith("/api/")
+            and request.path != "/api/health"
+            and bool(app_token)
+        )
+
+        rate_group_by_endpoint = {
+            "create_shared_space": "write",
+            "upload_shared_space_file": "write",
+            "upload_file": "write",
+            "upload_text": "write",
+            "audit_file": "audit",
+            "verify_file": "audit",
+            "verify_chunks": "audit",
+            "verify_merkle": "audit",
+            "verify_shared_space_file": "audit",
+            "challenge_node": "challenge",
+            "get_audit_log": "audit",
+        }
+        admin_status_token_supplied = (
+            request.headers.get("X-Admin-Token") is not None
+            or request.headers.get("Authorization", "").lower().startswith("bearer ")
+        )
+        if requires_app_token and not app_token_authorized:
+            group = "app_auth"
+            limit = app.config["DCAS_APP_RATE_LIMIT"]
+        elif request.endpoint == "admin_status" and admin_status_token_supplied:
+            group = "admin_status"
+            limit = app.config["DCAS_ADMIN_RATE_LIMIT"]
+        else:
+            group = rate_group_by_endpoint.get(request.endpoint)
+            if group is None:
+                return None
+            if group == "write":
+                limit = app.config["DCAS_WRITE_RATE_LIMIT"]
+            else:
+                limit = app.config["DCAS_RATE_LIMITS"][group]
+
+        if group is None:
+            return None
+
+        client_ip = request.remote_addr or "unknown"
+        if app.config["DCAS_TRUST_PROXY"]:
+            forwarded_for = request.headers.get("X-Forwarded-For")
+            forwarded_ip = (
+                forwarded_for.split(",", 1)[0].strip() if forwarded_for else ""
+            )
+            client_ip = forwarded_ip or client_ip
+        if not app.config["DCAS_RATE_LIMIT_LOCALHOST"]:
+            try:
+                if ipaddress.ip_address(client_ip).is_loopback:
+                    return None
+            except ValueError:
+                pass
+
+        now = time.monotonic()
+        window = app.config["DCAS_RATE_LIMIT_WINDOW_SECONDS"]
+        bucket_key = (client_ip, group)
+        cutoff = now - window
+        with rate_limit_lock:
+            if bucket_key not in rate_buckets and len(rate_buckets) >= 10000:
+                for existing_key, timestamps in list(rate_buckets.items()):
+                    timestamps[:] = [stamp for stamp in timestamps if stamp > cutoff]
+                    if not timestamps:
+                        del rate_buckets[existing_key]
+                if len(rate_buckets) >= 10000:
+                    response = jsonify({"error": "Rate limit exceeded. Try again later."})
+                    response.status_code = 429
+                    response.headers["Retry-After"] = str(window)
+                    return response
+
+            timestamps = rate_buckets[bucket_key]
+            timestamps[:] = [stamp for stamp in timestamps if stamp > cutoff]
+            if len(timestamps) >= limit:
+                retry_after = max(1, int(window - (now - timestamps[0])))
+                response = jsonify({"error": "Rate limit exceeded. Try again later."})
+                response.status_code = 429
+                response.headers["Retry-After"] = str(retry_after)
+                return response
+            timestamps.append(now)
+        return None
+
+    @app.before_request
+    def require_app_invite():
+        app_token = app.config["DCAS_APP_TOKEN"]
+        if (
+            app_token
+            and request.path.startswith("/api/")
+            and request.path != "/api/health"
+            and not hmac.compare_digest(
+                request.headers.get("X-App-Token", ""),
+                app_token,
+            )
+        ):
+            return jsonify({"error": "A valid app invite code is required."}), 401
+        return None
+
     @app.after_request
     def set_security_headers(response):
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Content-Type-Options"] = "nosniff"
-        if request.path == "/api/spaces" or request.path.startswith("/api/spaces/"):
+        response.headers["X-Frame-Options"] = "DENY"
+        if (
+            request.path == "/api/admin/status"
+            or request.path == "/api/spaces"
+            or request.path.startswith("/api/spaces/")
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -124,6 +303,20 @@ def create_app(
         """Serve the DCAS web dashboard."""
         return render_template("index.html")
 
+    @app.route("/api/health", methods=["GET"])
+    def health():
+        """Expose a minimal unauthenticated health check for host orchestration."""
+        return jsonify({"status": "ok"})
+
+    @app.route("/api/overview", methods=["GET"])
+    def overview():
+        """Return basic public service status for desktop-client setup validation."""
+        return jsonify({
+            "status": "ok",
+            "public_file_count": len(metadata.list_files()),
+            "network": network.get_network_status(),
+        })
+
     @app.route("/share/<space_id>")
     def shared_space_page(space_id):
         """Serve the recipient view; its capability arrives only in the URL fragment."""
@@ -136,6 +329,81 @@ def create_app(
         authorization = request.headers.get("Authorization", "")
         scheme, separator, token = authorization.partition(" ")
         return token.strip() if separator and scheme.lower() == "bearer" else ""
+
+    def admin_token_values() -> list[str]:
+        values = [request_token(), request.headers.get("X-Admin-Token", "").strip()]
+        return [value for value in values if value]
+
+    def is_admin_authorized() -> bool:
+        configured_token = app.config["DCAS_ADMIN_TOKEN"]
+        if not configured_token:
+            return False
+        return any(
+            hmac.compare_digest(token, configured_token)
+            for token in admin_token_values()
+        )
+
+    @app.route("/api/admin/status", methods=["GET"])
+    def admin_status():
+        """Report admin configuration and whether this request is authorized."""
+        return jsonify({
+            "admin_configured": bool(app.config["DCAS_ADMIN_TOKEN"]),
+            "authorized": is_admin_authorized(),
+            "chaos_enabled": app.config["DCAS_ENABLE_CHAOS"],
+        })
+
+    def authorization_error():
+        if not admin_token_values() and not request.headers.get("X-Access-Token"):
+            return jsonify({"error": "Authorization is required."}), 401
+        return jsonify({"error": "The supplied authorization is invalid or insufficient."}), 403
+
+    def is_access_authorized() -> bool:
+        configured_token = app.config["DCAS_ACCESS_TOKEN"]
+        if not configured_token:
+            return True
+        tokens = [request_token(), request.headers.get("X-Access-Token", "").strip()]
+        return is_admin_authorized() or any(
+            token and hmac.compare_digest(token, configured_token)
+            for token in tokens
+        )
+
+    def serialize_quota_upload(view):
+        @wraps(view)
+        def wrapped(*args, **kwargs):
+            with quota_lock:
+                return view(*args, **kwargs)
+
+        return wrapped
+
+    def quota_error(
+        incoming_size: int,
+        *,
+        space_id: str | None = None,
+        replacing_cid: str | None = None,
+    ) -> tuple[dict, int] | None:
+        global_quota = app.config["DCAS_GLOBAL_STORAGE_QUOTA_BYTES"]
+        space_quota = app.config["DCAS_SPACE_STORAGE_QUOTA_BYTES"]
+        replaced_file = metadata.get_file_info(replacing_cid) if replacing_cid else None
+        global_used = sum(
+            item["total_size"] for item in metadata.list_files(include_private=True)
+        )
+        if replaced_file:
+            global_used -= replaced_file["total_size"]
+        if global_used + incoming_size > app.config["DCAS_MAX_STORAGE_BYTES"]:
+            return {"error": "Maximum storage capacity exceeded."}, 507
+        if global_quota:
+            if global_used + incoming_size > global_quota:
+                return {"error": "Global storage quota exceeded."}, 507
+
+        if space_id is not None and space_quota:
+            existing_file_size = sum(
+                item["total_size"] for item in metadata.list_files(space_id=space_id)
+            )
+            if replaced_file and replaced_file.get("space_id") == space_id:
+                existing_file_size -= replaced_file["total_size"]
+            if existing_file_size + incoming_size > space_quota:
+                return {"error": "Shared-space storage quota exceeded."}, 507
+        return None
 
     def get_space_access(space_id: str) -> tuple[dict | None, str | None]:
         space = metadata.get_shared_space(space_id)
@@ -151,6 +419,23 @@ def create_app(
         if share_hash and hmac.compare_digest(digest, share_hash):
             return space, "writer" if space.get("allow_upload") else "reader"
         return space, None
+
+    def download_response(file_data: bytes, filename: str):
+        sanitized_filename = "".join(
+            character
+            for character in filename
+            if character not in '"\r\n/\\' and 32 <= ord(character) < 127
+        ).strip() or "download"
+        response = send_file(
+            io.BytesIO(file_data),
+            download_name=sanitized_filename,
+            as_attachment=True,
+        )
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="{sanitized_filename}"'
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     def private_file_response(cid: str):
         info = metadata.get_file_info(cid)
@@ -175,6 +460,8 @@ def create_app(
 
     @app.route("/api/spaces", methods=["POST"])
     def create_shared_space():
+        if not is_access_authorized():
+            return authorization_error()
         data = request.get_json(silent=True)
         if not isinstance(data, dict) or not isinstance(data.get("name"), str):
             return jsonify({"error": "A space name is required"}), 400
@@ -219,6 +506,7 @@ def create_app(
         })
 
     @app.route("/api/spaces/<space_id>/files", methods=["POST"])
+    @serialize_quota_upload
     def upload_shared_space_file(space_id):
         space, access = get_space_access(space_id)
         if space is None or access not in ("admin", "writer"):
@@ -230,6 +518,9 @@ def create_app(
             return jsonify({"error": "No selected file"}), 400
 
         file_data = file.read()
+        quota_failure = quota_error(len(file_data), space_id=space_id)
+        if quota_failure:
+            return jsonify(quota_failure[0]), quota_failure[1]
         if not file_data.startswith(b"DCAS1"):
             return jsonify({"error": "Shared-space uploads must use the DCAS1 client-side envelope"}), 400
         try:
@@ -267,12 +558,11 @@ def create_app(
             file_data = storage_encryptor.decrypt(file_data)
         except StorageEncryptionError:
             return jsonify({"error": "Stored file could not be decrypted; check the storage key and data integrity."}), 500
-        metadata.log_event("RETRIEVE", cid, manifest["filename"], "Shared file downloaded")
-        return send_file(
-            io.BytesIO(file_data),
-            download_name=manifest["filename"],
-            as_attachment=True,
+        metadata.log_event(
+            "RETRIEVE",
+            details="Encrypted file downloaded from shared space",
         )
+        return download_response(file_data, manifest["filename"])
 
     @app.route("/api/spaces/<space_id>/files/<cid>/verify", methods=["POST"])
     def verify_shared_space_file(space_id, cid):
@@ -284,9 +574,7 @@ def create_app(
         result = verifier.verify_file_integrity(manifest)
         metadata.log_event(
             "VERIFY",
-            cid,
-            manifest["filename"],
-            result.message,
+            details="Encrypted shared-space file integrity checked",
             status="success" if result.passed else "failure",
         )
         return jsonify(result.to_dict())
@@ -309,11 +597,49 @@ def create_app(
         metadata.log_event("SPACE_LINK_REVOKE", details="Shared-space access link revoked")
         return jsonify({"message": "The shared access link has been revoked."})
 
+    @app.route("/api/spaces/<space_id>", methods=["DELETE"])
+    def delete_shared_space(space_id):
+        space, access = get_space_access(space_id)
+        if space is None or (access != "admin" and not is_admin_authorized()):
+            return jsonify({"error": "Shared space not found or owner access required"}), 404
+
+        files = metadata.list_files(space_id=space_id)
+        manifests = [
+            metadata.get_manifest(file_info["cid"])
+            for file_info in files
+        ]
+        deleted_files = sum(
+            1 for file_info in files if metadata.delete_file(file_info["cid"])
+        )
+
+        referenced_chunk_hashes = set()
+        for file_info in metadata.list_files(include_private=True):
+            manifest = metadata.get_manifest(file_info["cid"])
+            if manifest is not None:
+                referenced_chunk_hashes.update(
+                    placement["chunk_hash"]
+                    for placement in manifest.get("placements", [])
+                )
+        for manifest in manifests:
+            if manifest is not None:
+                network.delete_file_chunks(manifest, referenced_chunk_hashes)
+
+        if not metadata.delete_shared_space(space_id):
+            return jsonify({"error": "Shared space not found or owner access required"}), 404
+        metadata.log_event(
+            "SPACE_DELETE",
+            details=f"Shared space deleted with {deleted_files} files",
+        )
+        return jsonify({"space_id": space_id, "deleted_files": deleted_files})
+
     # ── Upload ──────────────────────────────────────────────────────
 
     @app.route("/api/upload", methods=["POST"])
+    @serialize_quota_upload
     def upload_file():
         """Upload a file to the decentralized network."""
+        if not is_access_authorized():
+            return authorization_error()
         if "file" not in request.files:
             return jsonify({"error": "No file part in request"}), 400
 
@@ -358,6 +684,13 @@ def create_app(
                 "replication_factor": old_manifest["replication_factor"],
             }), 201
 
+        quota_failure = quota_error(
+            len(file_data),
+            replacing_cid=source_cid.cid_string,
+        )
+        if quota_failure:
+            return jsonify(quota_failure[0]), quota_failure[1]
+
         # Encrypt before storage-node distribution; PoR tags cover ciphertext shards.
         try:
             stored_data = storage_encryptor.encrypt(file_data)
@@ -399,8 +732,11 @@ def create_app(
     # ── Upload raw text ─────────────────────────────────────────────
 
     @app.route("/api/upload/text", methods=["POST"])
+    @serialize_quota_upload
     def upload_text():
         """Upload text content directly."""
+        if not is_access_authorized():
+            return authorization_error()
         data = request.get_json(silent=True)
         if not isinstance(data, dict) or "content" not in data:
             return jsonify({"error": "Missing 'content' field"}), 400
@@ -439,6 +775,13 @@ def create_app(
                 "chunk_count": old_manifest["chunk_count"],
                 "merkle_root": old_manifest["merkle_root"],
             }), 201
+
+        quota_failure = quota_error(
+            len(content),
+            replacing_cid=source_cid.cid_string,
+        )
+        if quota_failure:
+            return jsonify(quota_failure[0]), quota_failure[1]
 
         try:
             stored_data = storage_encryptor.encrypt(content)
@@ -516,11 +859,7 @@ def create_app(
 
         metadata.log_event("RETRIEVE", cid, manifest["filename"], "File downloaded")
 
-        return send_file(
-            io.BytesIO(file_data),
-            download_name=manifest["filename"],
-            as_attachment=True,
-        )
+        return download_response(file_data, manifest["filename"])
 
     # ── Verify full file ────────────────────────────────────────────
 
@@ -667,6 +1006,10 @@ def create_app(
     @app.route("/api/network/fail/<node_id>", methods=["POST"])
     def fail_node(node_id):
         """Simulate a node failure (take offline)."""
+        if not is_admin_authorized():
+            return authorization_error()
+        if not app.config["DCAS_ENABLE_CHAOS"]:
+            return jsonify({"error": "Chaos/simulation routes are disabled."}), 403
         network.simulate_node_failure(node_id)
         metadata.log_event("NODE_FAILURE", node_id=node_id, details=f"Node {node_id} taken offline")
         return jsonify({"message": f"Node {node_id} is now offline."})
@@ -674,12 +1017,17 @@ def create_app(
     @app.route("/api/network/recover/<node_id>", methods=["POST"])
     def recover_node(node_id):
         """Recover a failed node (bring online)."""
+        if not is_admin_authorized():
+            return authorization_error()
+        if not app.config["DCAS_ENABLE_CHAOS"]:
+            return jsonify({"error": "Chaos/simulation routes are disabled."}), 403
         network.simulate_node_recovery(node_id)
         metadata.log_event("NODE_RECOVERY", node_id=node_id, details=f"Node {node_id} brought online")
         return jsonify({"message": f"Node {node_id} is now online."})
 
     # ── Audit log ───────────────────────────────────────────────────
 
+    @app.route("/api/events", methods=["GET"])
     @app.route("/api/audit-log", methods=["GET"])
     def get_audit_log():
         """View the audit log."""
@@ -687,8 +1035,14 @@ def create_app(
         event_type = request.args.get("event_type")
         limit = request.args.get("limit", 50, type=int)
         logs = metadata.get_audit_log(cid=cid, event_type=event_type, limit=limit)
-        private_cids = metadata.get_private_cids()
-        logs = [entry for entry in logs if entry.get("cid") not in private_cids]
+        public_cids = {
+            file_info["cid"] for file_info in metadata.list_files()
+        }
+        logs = [
+            entry
+            for entry in logs
+            if not entry.get("cid") or entry.get("cid") in public_cids
+        ]
         stats = metadata.get_audit_stats()
         return jsonify({"logs": logs, "stats": stats})
 
@@ -697,6 +1051,10 @@ def create_app(
     @app.route("/api/simulate/corrupt/<cid>/<int:chunk_index>", methods=["POST"])
     def corrupt_chunk(cid, chunk_index):
         """Simulate data corruption for testing."""
+        if not is_admin_authorized():
+            return authorization_error()
+        if not app.config["DCAS_ENABLE_CHAOS"]:
+            return jsonify({"error": "Chaos/simulation routes are disabled."}), 403
         denied = private_file_response(cid)
         if denied:
             return denied
@@ -721,9 +1079,15 @@ def create_app(
     @app.route("/api/file/<cid>", methods=["DELETE"])
     def delete_file(cid):
         """Delete a file's metadata and chunks not shared by other files."""
-        denied = private_file_response(cid)
-        if denied:
-            return denied
+        info = metadata.get_file_info(cid)
+        if info is None:
+            return jsonify({"error": "File not found"}), 404
+        if info.get("space_id"):
+            _, access = get_space_access(info["space_id"])
+            if access not in ("admin", "writer") and not is_admin_authorized():
+                return authorization_error()
+        elif not is_admin_authorized():
+            return authorization_error()
         manifest = metadata.get_manifest(cid)
         if manifest is None:
             return jsonify({"error": "File not found"}), 404
