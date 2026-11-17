@@ -2,12 +2,13 @@
 
 from .encryption import StorageEncryptionError, StorageEncryptor
 from .por import PairingPoR
+from ..database.protocols import MetadataStoreProtocol
 
 
 def migrate_shared_storage(components: dict) -> dict[str, int]:
     """Encrypt legacy shared files in place while preserving their CIDs."""
     network = components["network"]
-    metadata = components["metadata"]
+    metadata: MetadataStoreProtocol = components["metadata"]
     encryptor: StorageEncryptor = components["storage_encryptor"]
     migrated = 0
     already_encrypted = 0
@@ -105,7 +106,7 @@ def migrate_shared_storage(components: dict) -> dict[str, int]:
     return {"migrated": migrated, "already_encrypted": already_encrypted}
 
 
-def _referenced_chunks(metadata) -> set[str]:
+def _referenced_chunks(metadata: MetadataStoreProtocol) -> set[str]:
     referenced = set()
     for file_info in metadata.list_files(include_private=True):
         manifest = metadata.get_manifest(file_info["cid"])
@@ -116,7 +117,11 @@ def _referenced_chunks(metadata) -> set[str]:
     return referenced
 
 
-def _remove_retired_chunks(network, metadata, manifest: dict) -> None:
+def _remove_retired_chunks(
+    network,
+    metadata: MetadataStoreProtocol,
+    manifest: dict,
+) -> None:
     retired_hashes = manifest.get("storage_migration_old_chunks", [])
     if not retired_hashes:
         return

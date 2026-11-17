@@ -30,6 +30,7 @@ function node(tag, className, text) {
 
 function formatBytes(bytes) {
   const size = Number(bytes) || 0;
+  if (!Number.isFinite(size) || size < 0) return "0 B";
   if (size < 1024) return `${size} B`;
   const units = ["KB", "MB", "GB", "TB"];
   let value = size / 1024;

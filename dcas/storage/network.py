@@ -11,6 +11,7 @@ import ipaddress
 import json
 import os
 import re
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
@@ -233,74 +234,86 @@ class StorageNetwork:
         newly_stored_proofs: list[tuple[StorageNode, str, str, int]] = []
         newly_stored_tags: list[tuple[StorageNode, str, str, int]] = []
         try:
-            for chunk in chunks:
-                stored_on = []
-                for node in self._select_nodes_for_storage(chunk.hash):
-                    if len(stored_on) >= self.replication_factor:
-                        break
-                    already_present = node.has_chunk(chunk.hash)
-                    if node.store_chunk(chunk.hash, chunk.data):
-                        stored_on.append(node.node_id)
-                        if not already_present:
-                            newly_stored.append((node, chunk.hash))
+            with ExitStack() as batches:
+                for node in self.nodes:
+                    batches.enter_context(node.batch_metadata_writes())
 
-                if len(stored_on) < self.replication_factor:
-                    raise RuntimeError(
-                        f"Could not store chunk {chunk.index} on "
-                        f"{self.replication_factor} nodes."
-                    )
+                for chunk in chunks:
+                    stored_on = []
+                    for node in self._select_nodes_for_storage(chunk.hash):
+                        if len(stored_on) >= self.replication_factor:
+                            break
+                        already_present = node.has_chunk(chunk.hash)
+                        if node.store_chunk(chunk.hash, chunk.data):
+                            stored_on.append(node.node_id)
+                            if not already_present:
+                                newly_stored.append((node, chunk.hash))
 
-                placements.append({
-                    "chunk_index": chunk.index,
-                    "chunk_hash": chunk.hash,
-                    "chunk_size": chunk.size,
-                    "stored_on": stored_on,
-                })
-
-            for placement, proof in zip(placements, merkle_proofs):
-                for node_id in placement["stored_on"]:
-                    node = self._get_node(node_id)
-                    if node is None:
-                        raise RuntimeError(f"Storage node {node_id} disappeared during upload.")
-                    if node.store_merkle_proof(placement["chunk_hash"], merkle_root, proof):
-                        newly_stored_proofs.append((
-                            node,
-                            placement["chunk_hash"],
-                            merkle_root,
-                            placement["chunk_index"],
-                        ))
-                    elif not node.has_chunk(placement["chunk_hash"]):
+                    if len(stored_on) < self.replication_factor:
                         raise RuntimeError(
-                            f"Storage node {node_id} cannot persist the Merkle proof."
+                            f"Could not store chunk {chunk.index} on "
+                            f"{self.replication_factor} nodes."
                         )
 
-            if self.pdp is not None:
-                for sector_index, tag in enumerate(pdp_tags):
-                    data_offset = sector_index * self.pdp.SECTOR_SIZE
-                    chunk_index = data_offset // self.chunker.chunk_size
-                    placement = placements[chunk_index]
+                    placements.append({
+                        "chunk_index": chunk.index,
+                        "chunk_hash": chunk.hash,
+                        "chunk_size": chunk.size,
+                        "stored_on": stored_on,
+                    })
+
+            with ExitStack() as batches:
+                for node in self.nodes:
+                    batches.enter_context(node.batch_metadata_writes())
+
+                for placement, proof in zip(placements, merkle_proofs):
                     for node_id in placement["stored_on"]:
                         node = self._get_node(node_id)
                         if node is None:
-                            raise RuntimeError(
-                                f"Storage node {node_id} disappeared during PDP tag storage."
-                            )
-                        if node.store_pdp_tag(
-                            placement["chunk_hash"],
-                            file_id,
-                            sector_index,
-                            tag,
-                        ):
-                            newly_stored_tags.append((
+                            raise RuntimeError(f"Storage node {node_id} disappeared during upload.")
+                        if node.store_merkle_proof(placement["chunk_hash"], merkle_root, proof):
+                            newly_stored_proofs.append((
                                 node,
                                 placement["chunk_hash"],
-                                file_id,
-                                sector_index,
+                                merkle_root,
+                                placement["chunk_index"],
                             ))
                         elif not node.has_chunk(placement["chunk_hash"]):
                             raise RuntimeError(
-                                f"Storage node {node_id} cannot persist the PDP tag."
+                                f"Storage node {node_id} cannot persist the Merkle proof."
                             )
+
+            if self.pdp is not None:
+                with ExitStack() as batches:
+                    for node in self.nodes:
+                        batches.enter_context(node.batch_metadata_writes())
+
+                    for sector_index, tag in enumerate(pdp_tags):
+                        data_offset = sector_index * self.pdp.SECTOR_SIZE
+                        chunk_index = data_offset // self.chunker.chunk_size
+                        placement = placements[chunk_index]
+                        for node_id in placement["stored_on"]:
+                            node = self._get_node(node_id)
+                            if node is None:
+                                raise RuntimeError(
+                                    f"Storage node {node_id} disappeared during PDP tag storage."
+                                )
+                            if node.store_pdp_tag(
+                                placement["chunk_hash"],
+                                file_id,
+                                sector_index,
+                                tag,
+                            ):
+                                newly_stored_tags.append((
+                                    node,
+                                    placement["chunk_hash"],
+                                    file_id,
+                                    sector_index,
+                                ))
+                            elif not node.has_chunk(placement["chunk_hash"]):
+                                raise RuntimeError(
+                                    f"Storage node {node_id} cannot persist the PDP tag."
+                                )
         except Exception:
             for node, chunk_hash, tagged_file_id, sector_index in reversed(newly_stored_tags):
                 node.remove_pdp_tag(chunk_hash, tagged_file_id, sector_index)

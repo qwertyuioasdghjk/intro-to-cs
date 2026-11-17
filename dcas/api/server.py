@@ -31,14 +31,17 @@ import os
 import json
 import secrets
 import hmac
+import sqlite3
 import tempfile
 
 from flask import Flask, jsonify, render_template, request, send_file
+from pymongo.errors import PyMongoError
 
 from ..storage.network import StorageNetwork
 from ..verifier.verifier import IntegrityVerifier
 from ..database.metadata import MetadataStore
 from ..database.mongo_metadata import MongoMetadataStore
+from ..database.protocols import MetadataStoreProtocol
 from ..storage.encryption import StorageEncryptor, StorageEncryptionError
 from ..storage.por import PairingPoR
 
@@ -103,7 +106,7 @@ def create_app(
         if mongodb_database is not None
         else os.environ.get("DCAS_MONGODB_DATABASE", "dcas")
     )
-    metadata = (
+    metadata: MetadataStoreProtocol = (
         MongoMetadataStore(mongodb_uri, mongodb_database)
         if mongodb_uri
         else MetadataStore(db_path)
@@ -365,6 +368,9 @@ def create_app(
             )
         except RuntimeError as error:
             return jsonify({"error": str(error)}), 503
+        except (OSError, sqlite3.Error):
+            app.logger.exception("File upload failed during storage.")
+            return jsonify({"error": "Upload failed due to a storage error."}), 500
         manifest["storage_size"] = manifest["total_size"]
         manifest["total_size"] = len(file_data)
         manifest["storage_encrypted"] = True
@@ -372,7 +378,11 @@ def create_app(
         manifest["source_fingerprint"] = source_fingerprint
 
         # Store manifest in metadata DB
-        metadata.store_manifest(manifest, owner=owner, tags=tags)
+        try:
+            metadata.store_manifest(manifest, owner=owner, tags=tags)
+        except (OSError, sqlite3.Error, PyMongoError):
+            app.logger.exception("File upload failed while saving metadata.")
+            return jsonify({"error": "Upload failed while saving file metadata."}), 500
         retire_replaced_chunks(old_manifest, manifest["cid"]["cid"])
 
         return jsonify({

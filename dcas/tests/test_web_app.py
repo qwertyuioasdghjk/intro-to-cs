@@ -151,6 +151,21 @@ class TestWebApp(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(self.client.get("/api/files").get_json()["count"], 0)
 
+    def test_file_upload_returns_json_for_storage_errors(self):
+        network = self.app.extensions["dcas"]["network"]
+        with patch.object(network, "store_por_bytes", side_effect=OSError("private path")):
+            response = self.client.post(
+                "/api/upload",
+                data={"file": (io.BytesIO(b"upload data"), "upload.txt")},
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "Upload failed due to a storage error."},
+        )
+
     def test_dashboard_node_controls_update_network_status(self):
         initial_status = self.client.get("/api/network/status").get_json()
         node_id = initial_status["nodes"][0]["node_id"]

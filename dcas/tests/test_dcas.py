@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -37,6 +38,8 @@ import dcas.storage.por as por_module
 from dcas.storage.por import PairingPoR
 from dcas.verifier.verifier import IntegrityVerifier, VerificationStatus
 from dcas.database.metadata import MetadataStore
+from dcas.database.mongo_metadata import MongoMetadataStore
+from dcas.database.protocols import MetadataStoreProtocol
 
 NODE_AUTH_TOKEN = "test-node-auth-token-that-is-at-least-32-chars"
 
@@ -324,6 +327,35 @@ class TestStorageNode(unittest.TestCase):
         self.assertTrue(node.store_chunk("h1", b"12345"))
         self.assertFalse(node.store_chunk("h2", b"123456"))  # Would exceed 10 bytes
 
+    def test_used_space_tracks_store_replace_delete_and_reload(self):
+        self.node.store_chunk("first", b"12345")
+        self.node.store_chunk("second", b"abc")
+        self.assertEqual(self.node.used_space, 8)
+
+        self.node.store_chunk("first", b"12")
+        self.assertEqual(self.node.used_space, 5)
+
+        reloaded = StorageNode("test-node", self.node.storage_dir)
+        self.assertEqual(reloaded.used_space, 5)
+        self.assertTrue(reloaded.delete_chunk("second"))
+        self.assertEqual(reloaded.used_space, 2)
+
+    def test_chunk_stores_batch_metadata_persistence(self):
+        with patch.object(
+            self.node,
+            "_save_metadata",
+            wraps=self.node._save_metadata,
+        ) as save_metadata:
+            with self.node.batch_metadata_writes():
+                self.assertTrue(self.node.store_chunk("first", b"one"))
+                self.assertTrue(self.node.store_chunk("second", b"two"))
+                save_metadata.assert_not_called()
+            save_metadata.assert_called_once()
+
+        reloaded = StorageNode("test-node", self.node.storage_dir)
+        self.assertEqual(reloaded.chunk_count, 2)
+        self.assertEqual(reloaded.used_space, 6)
+
     def test_por_tags_are_batched_and_conflicts_do_not_partially_write(self):
         self.node.store_chunk("por-hash", b"shard")
         tags = {0: "tag-0", 1: "tag-1"}
@@ -401,6 +433,28 @@ class TestStorageNetwork(unittest.TestCase):
         manifest = self.network.store_bytes(data, filename="test.txt")
         retrieved = self.network.retrieve_file(manifest)
         self.assertEqual(retrieved, data)
+
+    def test_bulk_store_batches_node_metadata_writes(self):
+        self.network.chunker.chunk_size = 2
+        with ExitStack() as stack:
+            save_metadata = [
+                stack.enter_context(
+                    patch.object(
+                        node,
+                        "_save_metadata",
+                        wraps=node._save_metadata,
+                    )
+                )
+                for node in self.network.nodes
+            ]
+            manifest = self.network.store_bytes(b"0123456789")
+
+        self.assertEqual(manifest["chunk_count"], 5)
+        self.assertGreater(sum(mock.call_count for mock in save_metadata), 0)
+        self.assertLessEqual(
+            sum(mock.call_count for mock in save_metadata),
+            2 * len(self.network.nodes),
+        )
 
     def test_empty_data_round_trip(self):
         """Empty content can be stored and retrieved."""
@@ -1380,6 +1434,10 @@ class TestMetadataStore(unittest.TestCase):
         retrieved = self.db.get_manifest(cid_str)
         self.assertIsNotNone(retrieved)
         self.assertEqual(retrieved["filename"], "unnamed")
+
+    def test_metadata_backends_implement_shared_protocol(self):
+        self.assertIsInstance(self.db, MetadataStoreProtocol)
+        self.assertTrue(issubclass(MongoMetadataStore, MetadataStoreProtocol))
 
     def test_list_files(self):
         """List stored files."""

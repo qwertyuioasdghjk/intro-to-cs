@@ -9,7 +9,9 @@ and list the chunks it holds.
 import os
 import json
 import shutil
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Optional
 
 from .pdp import StoragePDP
@@ -42,7 +44,11 @@ class StorageNode:
         self.storage_dir = storage_dir
         self.capacity = capacity
         self.is_online = is_online
+        self._lock = RLock()
         self._metadata: dict[str, dict] = {}
+        self._metadata_batch_depth = 0
+        self._metadata_dirty = False
+        self._used_space = 0
 
         os.makedirs(self.storage_dir, exist_ok=True)
         self._load_metadata()
@@ -59,10 +65,35 @@ class StorageNode:
                 self._metadata = json.load(f)
         else:
             self._metadata = {}
+        self._used_space = sum(
+            info.get("size", 0) for info in self._metadata.values()
+        )
 
     def _save_metadata(self):
         with open(self._metadata_path, "w") as f:
             json.dump(self._metadata, f, indent=2)
+
+    def _persist_metadata(self):
+        if self._metadata_batch_depth:
+            self._metadata_dirty = True
+        else:
+            self._save_metadata()
+
+    @contextmanager
+    def batch_metadata_writes(self):
+        """Defer metadata persistence until a group of chunk writes completes."""
+        self._lock.acquire()
+        try:
+            self._metadata_batch_depth += 1
+            yield
+        finally:
+            self._metadata_batch_depth -= 1
+            try:
+                if self._metadata_batch_depth == 0 and self._metadata_dirty:
+                    self._metadata_dirty = False
+                    self._save_metadata()
+            finally:
+                self._lock.release()
 
     # ── Storage operations ──────────────────────────────────────────
 
@@ -70,14 +101,15 @@ class StorageNode:
         """Check node availability and capacity for a chunk without writing it."""
         if not isinstance(data_size, int) or isinstance(data_size, bool) or data_size < 0:
             raise ValueError("Chunk size must be a non-negative integer.")
-        if not self.is_online:
-            return False
+        with self._lock:
+            if not self.is_online:
+                return False
 
-        existing_size = self._metadata.get(chunk_hash, {}).get("size", 0)
-        return (
-            self.capacity <= 0
-            or self.used_space - existing_size + data_size <= self.capacity
-        )
+            existing_size = self._metadata.get(chunk_hash, {}).get("size", 0)
+            return (
+                self.capacity <= 0
+                or self.used_space - existing_size + data_size <= self.capacity
+            )
 
     def store_chunk(self, chunk_hash: str, data: bytes) -> bool:
         """
@@ -91,18 +123,21 @@ class StorageNode:
             True if stored successfully, False if the node is offline
             or has insufficient capacity.
         """
-        if not self.can_store_chunk(chunk_hash, len(data)):
-            return False
+        with self._lock:
+            if not self.can_store_chunk(chunk_hash, len(data)):
+                return False
 
-        chunk_path = os.path.join(self.storage_dir, chunk_hash)
-        with open(chunk_path, "wb") as f:
-            f.write(data)
+            chunk_path = os.path.join(self.storage_dir, chunk_hash)
+            with open(chunk_path, "wb") as f:
+                f.write(data)
 
-        chunk_metadata = self._metadata.setdefault(chunk_hash, {})
-        chunk_metadata["size"] = len(data)
-        chunk_metadata["stored_at"] = datetime.now(timezone.utc).isoformat()
-        self._save_metadata()
-        return True
+            existing_size = self._metadata.get(chunk_hash, {}).get("size", 0)
+            chunk_metadata = self._metadata.setdefault(chunk_hash, {})
+            chunk_metadata["size"] = len(data)
+            chunk_metadata["stored_at"] = datetime.now(timezone.utc).isoformat()
+            self._used_space += len(data) - existing_size
+            self._persist_metadata()
+            return True
 
     def retrieve_chunk(self, chunk_hash: str) -> Optional[bytes]:
         """
@@ -149,7 +184,7 @@ class StorageNode:
             return False
 
         root_proofs[merkle_root][index] = proof
-        self._save_metadata()
+        self._persist_metadata()
         return True
 
     def remove_merkle_proof(self, chunk_hash: str, merkle_root: str, leaf_index: int):
@@ -165,7 +200,7 @@ class StorageNode:
             root_proofs.pop(merkle_root, None)
         if not root_proofs:
             chunk_metadata.pop("merkle_proofs", None)
-        self._save_metadata()
+        self._persist_metadata()
 
     def retrieve_chunk_with_proof(
         self,
@@ -209,7 +244,7 @@ class StorageNode:
             return False
 
         file_tags[index] = tag
-        self._save_metadata()
+        self._persist_metadata()
         return True
 
     def remove_pdp_tag(self, chunk_hash: str, file_id: str, sector_index: int):
@@ -225,7 +260,7 @@ class StorageNode:
             tags.pop(file_id, None)
         if not tags:
             chunk_metadata.pop("pdp_tags", None)
-        self._save_metadata()
+        self._persist_metadata()
 
     def store_por_tag(
         self,
@@ -289,7 +324,7 @@ class StorageNode:
         shard_tags = node_tags.setdefault(str(shard_index), {})
         for _, index, tag in new_tags:
             shard_tags[index] = tag
-        self._save_metadata()
+        self._persist_metadata()
         return [sector_index for sector_index, _, _ in new_tags]
 
     def remove_por_tag(
@@ -341,7 +376,7 @@ class StorageNode:
             por_tags.pop(file_id, None)
         if not por_tags:
             chunk_metadata.pop("por_tags", None)
-        self._save_metadata()
+        self._persist_metadata()
 
     def respond_to_por_challenge(self, payload: dict) -> Optional[dict]:
         """Return a compact pairing-PoR response for this node's assigned shard."""
@@ -511,13 +546,16 @@ class StorageNode:
         Returns:
             True if deleted, False if not found.
         """
-        chunk_path = os.path.join(self.storage_dir, chunk_hash)
-        if os.path.exists(chunk_path):
-            os.remove(chunk_path)
-            self._metadata.pop(chunk_hash, None)
-            self._save_metadata()
-            return True
-        return False
+        with self._lock:
+            chunk_path = os.path.join(self.storage_dir, chunk_hash)
+            if os.path.exists(chunk_path):
+                os.remove(chunk_path)
+                chunk_metadata = self._metadata.pop(chunk_hash, None)
+                if chunk_metadata is not None:
+                    self._used_space -= chunk_metadata.get("size", 0)
+                self._persist_metadata()
+                return True
+            return False
 
     def list_chunks(self) -> list[str]:
         """Return a list of all chunk hashes stored on this node."""
@@ -530,9 +568,8 @@ class StorageNode:
     @property
     def used_space(self) -> int:
         """Total bytes used on this node."""
-        return sum(
-            info.get("size", 0) for info in self._metadata.values()
-        )
+        with self._lock:
+            return self._used_space
 
     @property
     def chunk_count(self) -> int:
@@ -555,7 +592,8 @@ class StorageNode:
         for name in self.list_chunks():
             os.remove(os.path.join(self.storage_dir, name))
         self._metadata = {}
-        self._save_metadata()
+        self._used_space = 0
+        self._persist_metadata()
 
     def __repr__(self) -> str:
         status = "online" if self.is_online else "offline"
