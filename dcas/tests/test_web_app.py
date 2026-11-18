@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -14,16 +15,18 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from werkzeug.serving import make_server
 
 import dcas.desktop_client as desktop_client
 import scripts.start_host as start_host
 from dcas.api.server import create_app
 from dcas.desktop_client import LoopbackProxyServer
-from dcas.run_server import load_env_file, parse_args
+from dcas.run_server import load_env_file, main as run_server_main, parse_args
 from scripts.build_desktop_client import main as build_desktop_client
 from scripts.start_host import (
     checkpoint_sqlite_wal,
     extract_quick_tunnel_url,
+    ensure_server_port_available,
     initialize_host_environment,
     report_sqlite_checkpoint,
 )
@@ -242,6 +245,43 @@ class TestWebApp(unittest.TestCase):
             self.assertIsNone(body["admin_token"])
             self.assertIsNone(body["authorization"])
             self.assertEqual(body["body"], "uploaded payload")
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            upstream.shutdown()
+            upstream.server_close()
+            proxy_thread.join(timeout=2)
+            upstream_thread.join(timeout=2)
+
+    def test_admin_unlock_succeeds_through_desktop_proxy_with_app_token(self):
+        self.app.config["DCAS_APP_TOKEN"] = "test-app-token"
+        self.app.config["DCAS_ADMIN_TOKEN"] = "test-admin-token"
+        upstream = make_server("127.0.0.1", 0, self.app, threaded=True)
+        upstream_thread = threading.Thread(
+            target=upstream.serve_forever,
+            daemon=True,
+        )
+        upstream_thread.start()
+        proxy = LoopbackProxyServer(
+            ("127.0.0.1", 0),
+            f"http://127.0.0.1:{upstream.server_port}",
+            "test-app-token",
+        )
+        proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+        proxy_thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{proxy.server_address[1]}/api/admin/status",
+                headers={
+                    "X-Admin-Token": "test-admin-token",
+                    "Authorization": "Bearer unrelated-token",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                status = json.loads(response.read().decode("utf-8"))
+
+            self.assertTrue(status["admin_configured"])
+            self.assertTrue(status["authorized"])
         finally:
             proxy.shutdown()
             proxy.server_close()
@@ -980,6 +1020,34 @@ class TestWebApp(unittest.TestCase):
             self.assertEqual(os.environ["DCAS_TEST_ENV_FILE_VALUE"], "from-file")
             self.assertEqual(os.environ["DCAS_TEST_ENV_SHELL_VALUE"], "from-shell")
 
+    def test_run_server_loads_env_before_creating_app(self):
+        admin_token = "configured-before-app-creation"
+        app = MagicMock()
+        app.extensions = {"dcas": {"metadata": MagicMock()}}
+
+        def create_app_after_env_load(**_kwargs):
+            self.assertEqual(os.environ["DCAS_ADMIN_TOKEN"], admin_token)
+            return app
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "dcas.run_server.load_env_file",
+                side_effect=lambda: os.environ.update(
+                    {"DCAS_ADMIN_TOKEN": admin_token}
+                ),
+            ),
+            patch(
+                "dcas.api.server.create_app",
+                side_effect=create_app_after_env_load,
+            ),
+            patch(
+                "dcas.storage.migration.migrate_shared_storage",
+                return_value={"migrated": 0, "already_encrypted": 0},
+            ),
+        ):
+            run_server_main(["--migrate-shared-storage"])
+
     def test_host_environment_initializes_tokens_and_preserves_existing_values(self):
         env_path = os.path.join(self.test_dir, ".env")
         with open(env_path, "w", encoding="utf-8") as env_file:
@@ -992,7 +1060,10 @@ class TestWebApp(unittest.TestCase):
                 "CUSTOM_SETTING=keep-me\n"
             )
 
-        initialized = initialize_host_environment(env_path)
+        with patch.dict(os.environ, {}, clear=True):
+            initialized = initialize_host_environment(env_path)
+            self.assertEqual(os.environ["DCAS_ADMIN_TOKEN"], initialized["DCAS_ADMIN_TOKEN"])
+            self.assertEqual(os.environ["DCAS_APP_TOKEN"], initialized["DCAS_APP_TOKEN"])
         self.assertTrue(initialized["DCAS_APP_TOKEN"])
         self.assertTrue(initialized["DCAS_ADMIN_TOKEN"])
         self.assertEqual(initialized["DCAS_TUNNEL_NAME"], "stable-tunnel")
@@ -1011,6 +1082,14 @@ class TestWebApp(unittest.TestCase):
         self.assertTrue(os.path.isfile(new_env_path))
         self.assertTrue(created["DCAS_APP_TOKEN"])
         self.assertTrue(created["DCAS_ADMIN_TOKEN"])
+
+    def test_host_fails_clearly_when_api_port_is_occupied(self):
+        occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(occupied.close)
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen()
+        with self.assertRaisesRegex(RuntimeError, "is already in use"):
+            ensure_server_port_available("127.0.0.1", occupied.getsockname()[1])
 
     def test_extract_quick_tunnel_url_from_cloudflared_logs(self):
         log_line = (

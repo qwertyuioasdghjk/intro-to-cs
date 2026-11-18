@@ -31,14 +31,6 @@ import signal
 import sys
 from pathlib import Path
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from dcas.api.server import create_app
-from dcas.storage.migration import migrate_shared_storage
-from dcas.storage.network import is_secure_node_url, is_valid_node_auth_token
-
-
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="DCAS web application and REST API")
     parser.add_argument("--host", default=None, help="Host to bind to (default: 127.0.0.1)")
@@ -99,6 +91,12 @@ def is_loopback_host(host):
 
 def main(argv=None):
     load_env_file()
+    # Import the app only after .env has populated os.environ.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from dcas.api.server import create_app
+    from dcas.storage.migration import migrate_shared_storage
+    from dcas.storage.network import is_secure_node_url, is_valid_node_auth_token
+
     args = parse_args(argv)
     node_urls = {}
     for node_url in args.node_url:

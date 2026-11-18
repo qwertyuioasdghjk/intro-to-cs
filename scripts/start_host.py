@@ -7,6 +7,7 @@ import secrets
 import shutil
 import signal
 import sqlite3
+import socket
 import subprocess
 import sys
 import threading
@@ -68,7 +69,20 @@ def initialize_host_environment(env_path):
         encoding="utf-8",
     )
     temporary_path.replace(env_path)
+    os.environ.update(values)
     return values
+
+
+def ensure_server_port_available(host="127.0.0.1", port=5000):
+    """Fail before startup if another process already owns the API port."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+            server_socket.bind((host, port))
+    except OSError as error:
+        raise RuntimeError(
+            f"Port {port} on {host} is already in use. Stop the existing "
+            "server before starting the DCAS host."
+        ) from error
 
 
 def extract_quick_tunnel_url(line):
@@ -213,6 +227,12 @@ def _print_connection_summary(server_url, app_token, admin_token):
 
 def run_host(project_root=None):
     project_root = Path(project_root or Path(__file__).resolve().parent.parent)
+    try:
+        ensure_server_port_available()
+    except RuntimeError as error:
+        print(f"Host startup failed: {error}", flush=True)
+        return 1
+
     env_path = project_root / ".env"
     host_config = initialize_host_environment(env_path)
 
